@@ -4,6 +4,7 @@ nltk
 numpy
 requests
 yt-dlp
+pytubefix
 python-dotenv
 openai
 youtube-transcript-api

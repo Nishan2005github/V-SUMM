@@ -49,7 +49,7 @@ elif OPENROUTER_KEY:
 else:
     AI_BASE_URL = "https://openrouter.ai/api/v1"
     AI_MODELS = []
-    print("[AI] WARNING: OPENROUTER_API_KEY / GROQ_API_KEY not found in .env")
+    print("[AI] WARNING: OPENROUTER_API_KEY / GROQ_API_KEY not found in environment")
 
 # ----------------- FLASK & DATABASE CONFIG ----------------- #
 app = Flask(__name__)
@@ -317,9 +317,30 @@ def download_video(url, job_id, height=480):
             'concurrent_fragment_downloads': 4,
             'merge_output_format': 'mp4',
             'progress_hooks': [ydl_hook],
+            'extractor_args': {
+                'youtube': {
+                    'player_client': ['android', 'ios', 'web'],
+                }
+            },
         }
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([clean_url])
+
+        cookies_txt = os.getenv("YOUTUBE_COOKIES", "").strip()
+        cookie_file = None
+        if cookies_txt:
+            cookie_file = os.path.join(app.config['AUDIO_FOLDER'], f"{job_id}_cookies.txt")
+            with open(cookie_file, "w", encoding="utf-8") as cf:
+                cf.write(cookies_txt)
+            ydl_opts['cookiefile'] = cookie_file
+
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([clean_url])
+        finally:
+            if cookie_file and os.path.exists(cookie_file):
+                try:
+                    os.remove(cookie_file)
+                except Exception:
+                    pass
     else:
         with requests.get(url, stream=True, timeout=60) as response:
             response.raise_for_status()
@@ -500,7 +521,7 @@ def run_pipeline(job_id, video_source, options):
             except Exception:
                 pass
 
-        # 2. Delete older videos/frames from previous runs (keep current job_id so user can play/download it)
+        # 2. Purge older videos/frames from previous runs while keeping current job_id for playback/download
         for folder in (app.config['UPLOAD_FOLDER'], app.config['FRAMES_FOLDER']):
             try:
                 for fname in os.listdir(folder):
@@ -622,7 +643,7 @@ def ask_question():
     if not question:
         return jsonify({"error": "No question provided"}), 400
     if not OPENROUTER_KEY:
-        return jsonify({"error": "API key not configured in .env"}), 500
+        return jsonify({"error": "API key not configured in environment"}), 500
 
     video_rec = db.session.get(VideoRecord, video_id) if video_id else VideoRecord.query.order_by(VideoRecord.id.desc()).first()
     if not video_rec:

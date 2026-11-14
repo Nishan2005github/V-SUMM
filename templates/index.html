@@ -118,7 +118,6 @@ body{
   border-bottom:1px solid rgba(255,255,255,.05);
 }
 
-/* subtle gradient line at bottom of nav */
 .transport-bar::after{
   content:'';
   position:absolute;bottom:0;left:0;right:0;height:1px;
@@ -248,7 +247,6 @@ body{
   transform:translateY(-1px);
 }
 
-/* scroll arrow */
 .scroll-hint{
   margin-top:2.5rem;
   animation:fadeUp .5s .32s ease both;
@@ -292,7 +290,6 @@ body{
 .panel:nth-child(2){animation-delay:.07s;}
 .panel:nth-child(3){animation-delay:.14s;}
 
-/* gradient border via box-shadow + pseudo */
 .panel::before{
   content:'';
   position:absolute;inset:0;
@@ -311,7 +308,6 @@ body{
   transform:translateY(-1px);
 }
 
-/* inner highlight streak */
 .panel::after{
   content:'';
   position:absolute;top:0;left:5%;right:5%;height:1px;
@@ -559,7 +555,6 @@ select{
   filter:grayscale(.8);
 }
 
-/* RIPPLE */
 .ripple{
   position:absolute;border-radius:50%;
   background:rgba(255,255,255,.3);
@@ -658,13 +653,17 @@ select{
 }
 
 /* ======================
-   RESULTS
+   RESULTS & YOUTUBE EMBED
 ====================== */
-video{
+video, .yt-embed-frame{
   width:100%;border-radius:var(--r14);
   background:#000;border:1px solid var(--border);
   display:block;
   box-shadow:0 16px 60px rgba(0,0,0,.7);
+}
+.yt-embed-frame{
+  aspect-ratio:16/9;
+  min-height:280px;
 }
 
 .card-row-head{
@@ -872,9 +871,6 @@ video{
   white-space:nowrap;
 }
 
-/* ======================
-   RESULTS REVEAL
-====================== */
 #resultsSection{
   animation:fadeUp .5s cubic-bezier(.4,0,.2,1) both;
 }
@@ -1149,6 +1145,13 @@ video{
         <p class="panel-label">02 &mdash; MONITOR</p>
         <h2 class="panel-title" style="margin-bottom:14px;">Processed output</h2>
         <video id="videoPlayer" controls></video>
+        <iframe
+          id="ytEmbedPlayer"
+          class="yt-embed-frame d-none"
+          frameborder="0"
+          allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
+          allowfullscreen
+        ></iframe>
         <a id="downloadBtn" download class="btn-ghost"
            style="margin-top:14px;width:100%;text-align:center;display:block;">
           &#8595;&ensp;Download source video
@@ -1206,8 +1209,6 @@ video{
       <div id="searchResults"></div>
     </div>
 
-
-
     <!-- 07 Q&A -->
     <div class="panel" id="qaSection">
       <p class="panel-label">07 &mdash; Q &amp; A</p>
@@ -1218,8 +1219,7 @@ video{
         <input type="text" id="qaInput" placeholder="e.g. What is the main topic? Who is speaking?&hellip;">
         <button class="btn-ghost" type="button" id="qaBtn">Ask AI</button>
       </div>
-      <div id="qaAnswer" style="display:none;"
-           style="margin-top:14px;padding:18px 20px;
+      <div id="qaAnswer" style="display:none;margin-top:14px;padding:18px 20px;
                   background:rgba(0,240,200,.04);
                   border:1px solid rgba(0,240,200,.2);
                   border-radius:14px;">
@@ -1235,7 +1235,7 @@ video{
       </div>
       <div id="qaLoading" style="display:none;margin-top:14px;
            font-family:'JetBrains Mono',monospace;font-size:.74rem;
-           color:var(--teal);display:flex;align-items:center;gap:8px;">
+           color:var(--teal);align-items:center;gap:8px;">
         <span style="width:7px;height:7px;border-radius:50%;background:var(--teal);
                      box-shadow:0 0 10px var(--teal);
                      animation:recP 1s ease infinite;display:inline-block;"></span>
@@ -1245,7 +1245,7 @@ video{
   </section>
 </main>
 
-<!-- RIPPLE JS (inline, tiny) -->
+<!-- RIPPLE JS -->
 <script>
 document.querySelectorAll('.btn-run').forEach(btn=>{
   btn.addEventListener('click',function(e){
@@ -1264,24 +1264,92 @@ const PRESETS = JSON.parse('{{ presets | tojson | safe }}');
 </script>
 <script src="/static/js/main.js"></script>
 
-<!-- Q&A JavaScript -->
+<!-- YOUTUBE REAL PLAYBACK + TIMESTAMP SEEK + Q&A BRIDGE -->
 <script>
 (function(){
   let currentVideoId = null;
+  let activeYtId = null;
 
-  // Watch for resultsSection becoming visible to grab video_id
-  const observer = new MutationObserver(() => {
-    const rs = document.getElementById('resultsSection');
-    if (rs && !rs.classList.contains('d-none')) {
-      // Try to get video_id from the page
-      // main.js stores it on window or we can read from DOM
-      if (window._vsummVideoId) currentVideoId = window._vsummVideoId;
+  function parseYouTubeId(url) {
+    if (!url) return null;
+    const m = url.match(/(?:v=|youtu\.be\/|embed\/|shorts\/)([A-Za-z0-9_-]{11})/);
+    return m ? m[1] : null;
+  }
+
+  const videoEl = document.getElementById('videoPlayer');
+  const ytIframe = document.getElementById('ytEmbedPlayer');
+  const dlBtn = document.getElementById('downloadBtn');
+  const urlInput = document.getElementById('videoUrl');
+  const fileInput = document.getElementById('videoFile');
+
+  // Bridge videoPlayer.currentTime setter so clicking any transcript line or slide seeks the YouTube player
+  if (videoEl) {
+    const proto = Object.getPrototypeOf(videoEl);
+    const nativeDesc = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'currentTime') ||
+                       Object.getOwnPropertyDescriptor(proto, 'currentTime');
+    if (nativeDesc && nativeDesc.set) {
+      Object.defineProperty(videoEl, 'currentTime', {
+        get: function() {
+          return nativeDesc.get.call(this);
+        },
+        set: function(sec) {
+          if (activeYtId && ytIframe && !ytIframe.classList.contains('d-none')) {
+            const s = Math.max(0, Math.floor(Number(sec) || 0));
+            ytIframe.src = `https://www.youtube.com/embed/${activeYtId}?start=${s}&autoplay=1&rel=0`;
+          } else {
+            nativeDesc.set.call(this, sec);
+          }
+        }
+      });
     }
-  });
-  const rs = document.getElementById('resultsSection');
-  if (rs) observer.observe(rs, { attributes: true });
+    const origPlay = videoEl.play.bind(videoEl);
+    videoEl.play = function() {
+      if (activeYtId && ytIframe && !ytIframe.classList.contains('d-none')) {
+        return Promise.resolve();
+      }
+      return origPlay();
+    };
+  }
 
-  // Patch: intercept the result to grab video_id
+  function syncPlayerMode() {
+    const rawUrl = (urlInput && urlInput.value || '').trim();
+    const hasLocalFile = fileInput && fileInput.files && fileInput.files.length > 0;
+    const ytId = !hasLocalFile ? parseYouTubeId(rawUrl) : null;
+
+    if (ytId) {
+      activeYtId = ytId;
+      if (videoEl) {
+        videoEl.pause();
+        videoEl.classList.add('d-none');
+      }
+      if (ytIframe) {
+        ytIframe.src = `https://www.youtube.com/embed/${ytId}?rel=0`;
+        ytIframe.classList.remove('d-none');
+      }
+      if (dlBtn) {
+        dlBtn.removeAttribute('download');
+        dlBtn.href = `https://www.youtube.com/watch?v=${ytId}`;
+        dlBtn.target = '_blank';
+        dlBtn.innerHTML = '&#8599;&ensp;Open original video on YouTube';
+      }
+    } else {
+      activeYtId = null;
+      if (ytIframe) {
+        ytIframe.src = '';
+        ytIframe.classList.add('d-none');
+      }
+      if (videoEl) {
+        videoEl.classList.remove('d-none');
+      }
+      if (dlBtn) {
+        dlBtn.setAttribute('download', '');
+        dlBtn.removeAttribute('target');
+        dlBtn.innerHTML = '&#8595;&ensp;Download source video';
+      }
+    }
+  }
+
+  // Intercept /api/status/ responses to grab video_id and activate player mode when job finishes
   const origFetch = window.fetch;
   window.fetch = function(...args) {
     return origFetch.apply(this, args).then(resp => {
@@ -1291,6 +1359,7 @@ const PRESETS = JSON.parse('{{ presets | tojson | safe }}');
         clone.json().then(data => {
           if (data && data.result && data.result.video_id) {
             currentVideoId = data.result.video_id;
+            setTimeout(syncPlayerMode, 50);
           }
         }).catch(()=>{});
       }
@@ -1324,13 +1393,6 @@ const PRESETS = JSON.parse('{{ presets | tojson | safe }}');
       if (data.answer) {
         answerText.textContent = data.answer;
         answerBox.style.display = 'block';
-        answerBox.style.cssText = [
-          "margin-top:14px",
-          "padding:18px 20px",
-          "background:rgba(0,240,200,.04)",
-          "border:1px solid rgba(0,240,200,.2)",
-          "border-radius:14px"
-        ].join(';');
       } else {
         answerText.textContent = data.error || 'Something went wrong.';
         answerBox.style.display = 'block';
@@ -1342,7 +1404,6 @@ const PRESETS = JSON.parse('{{ presets | tojson | safe }}');
     }
   });
 
-  // Allow pressing Enter in QA input
   document.getElementById('qaInput').addEventListener('keydown', function(e){
     if (e.key === 'Enter') document.getElementById('qaBtn').click();
   });

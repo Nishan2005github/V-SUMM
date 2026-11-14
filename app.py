@@ -404,8 +404,6 @@ def _parse_json3_subtitles(json3_path):
 
 
 def _fetch_transcript_via_public_apis(yt_id):
-    """Fetches YouTube transcript from Tactiq / Invidious / Piped public APIs when Render IP is rate-limited."""
-    # 1. Tactiq public YouTube transcript endpoint
     try:
         r = requests.post(
             "https://tactiq-apps-prod.tactiq.io/transcript",
@@ -429,7 +427,6 @@ def _fetch_transcript_via_public_apis(yt_id):
     except Exception as e:
         print(f"[Tactiq transcript API] {e}")
 
-    # 2. Invidious captions API
     for api in ("https://inv.nadeko.net", "https://invidious.nerdvpn.de", "https://yewtu.be"):
         try:
             r = requests.get(f"{api}/api/v1/captions/{yt_id}", timeout=10, headers={"User-Agent": "Mozilla/5.0"})
@@ -450,7 +447,6 @@ def _fetch_transcript_via_public_apis(yt_id):
         except Exception:
             continue
 
-    # 3. Piped subtitles API
     for api in ("https://pipedapi.adminforge.de", "https://pipedapi.drgns.space", "https://pipedapi.smnz.de"):
         try:
             r = requests.get(f"{api}/streams/{yt_id}", timeout=10, headers={"User-Agent": "Mozilla/5.0"})
@@ -475,8 +471,6 @@ def _fetch_transcript_via_public_apis(yt_id):
 
 
 def fetch_real_youtube_transcript(clean_url, yt_id, job_id, cookie_file=None, task="transcribe"):
-    """Fetches the real spoken transcript of a YouTube video across 5 independent methods."""
-    # Method 1: Public Transcript APIs (Tactiq / Invidious / Piped - immune to YouTube datacenter blocks)
     if yt_id:
         pub_txt, pub_segs, pub_lang = _fetch_transcript_via_public_apis(yt_id)
         if pub_txt and pub_segs:
@@ -484,7 +478,6 @@ def fetch_real_youtube_transcript(clean_url, yt_id, job_id, cookie_file=None, ta
                 pub_txt = ai_translate_to_english(pub_txt)
             return pub_txt, pub_segs, pub_lang
 
-    # Method 2: youtube-transcript-api (any language, manual or auto-generated)
     if YouTubeTranscriptApi is not None and yt_id:
         try:
             if hasattr(YouTubeTranscriptApi, "list_transcripts"):
@@ -539,7 +532,6 @@ def fetch_real_youtube_transcript(clean_url, yt_id, job_id, cookie_file=None, ta
         except Exception as e:
             print(f"[youtube_transcript_api] {e}")
 
-    # Method 3: yt-dlp subtitle extraction across ALL available languages
     sub_base = os.path.join(app.config['AUDIO_FOLDER'], f"{job_id}_sub")
     for client_list in (["web", "mweb"], ["ios", "android_vr", "tv"], None):
         try:
@@ -579,7 +571,6 @@ def fetch_real_youtube_transcript(clean_url, yt_id, job_id, cookie_file=None, ta
             print(f"[yt-dlp subtitle extract] {e}")
             continue
 
-    # Method 4: pytubefix captions
     if PyTubeYouTube is not None:
         for client_name in ("WEB", "ANDROID_VR", "MWEB", "IOS", "TV_EMBED"):
             try:
@@ -600,19 +591,17 @@ def fetch_real_youtube_transcript(clean_url, yt_id, job_id, cookie_file=None, ta
             except Exception:
                 continue
 
-    # Method 5: Rich Video Metadata / Description / Title fallback (guarantees pipeline never crashes on music/no-caption videos)
     try:
         meta_parts = []
-        if cookie_file or True:
-            try:
-                with yt_dlp.YoutubeDL({'quiet': True, 'skip_download': True, 'ignore_no_formats_error': True, **({'cookiefile': cookie_file} if cookie_file else {})}) as ydl:
-                    info = ydl.extract_info(clean_url, download=False) or {}
-                    if info.get("title"):
-                        meta_parts.append(f"Video Title: {info['title']}.")
-                    if info.get("description"):
-                        meta_parts.append(info["description"])
-            except Exception:
-                pass
+        try:
+            with yt_dlp.YoutubeDL({'quiet': True, 'skip_download': True, 'ignore_no_formats_error': True, **({'cookiefile': cookie_file} if cookie_file else {})}) as ydl:
+                info = ydl.extract_info(clean_url, download=False) or {}
+                if info.get("title"):
+                    meta_parts.append(f"Video Title: {info['title']}.")
+                if info.get("description"):
+                    meta_parts.append(info["description"])
+        except Exception:
+            pass
         if not meta_parts:
             r = requests.get(f"https://noembed.com/embed?url={clean_url}", timeout=10)
             if r.status_code == 200:
@@ -696,7 +685,6 @@ def download_video(url, job_id, height=480):
 
         cookie_file = _prepare_cookie_file(job_id)
 
-        # Since index.html plays the real YouTube embed in the browser, we accept bestaudio OR video so Groq Whisper can transcribe
         profiles = [
             {"clients": ["ios", "android_vr", "mweb"], "use_cookie": False, "fmt": "bestaudio/best[height<=480]/best/worst"},
             {"clients": ["mweb", "web_creator", "tv"], "use_cookie": True,  "fmt": f"best[height<={h}]/bestaudio/best/worst"},
@@ -745,7 +733,6 @@ def download_video(url, job_id, height=480):
                     print(f"[yt-dlp download retry] {e}")
                     continue
 
-            # Try pytubefix audio or video stream
             if PyTubeYouTube is not None:
                 for client_name in ("ANDROID_VR", "MWEB", "IOS", "WEB", "TV_EMBED"):
                     try:
@@ -844,7 +831,6 @@ def run_pipeline(job_id, video_source, options, youtube_url=None, has_real_video
         detected_language = "en"
         original_transcript_text = None
 
-        # 1. If we downloaded real audio/video, transcribe it via Groq Cloud Whisper
         if has_real_video and video_source and os.path.exists(video_source):
             try:
                 set_job(job_id, status="running", stage="Extracting audio", progress=15)
@@ -867,7 +853,6 @@ def run_pipeline(job_id, video_source, options, youtube_url=None, has_real_video
             except Exception as whisper_err:
                 print(f"[Whisper fallback to captions] {whisper_err}")
 
-        # 2. If YouTube blocked the raw stream on Render's IP, get the transcript via Public APIs / Captions
         if (not transcript_text or not segments_data) and yt_id:
             set_job(job_id, status="running", stage="Fetching YouTube transcript...", progress=30)
             cookie_file = _prepare_cookie_file(job_id)
@@ -880,7 +865,6 @@ def run_pipeline(job_id, video_source, options, youtube_url=None, has_real_video
                 )
                 original_transcript_text = orig_txt
 
-        # Build slide thumbnails for YouTube links if video_source is audio-only or missing
         if yt_id:
             est_dur = segments_data[-1]["end"] if segments_data else 120
             storyboard_mp4 = os.path.join(app.config['UPLOAD_FOLDER'], f"{job_id}_slides.mp4")
@@ -1125,25 +1109,28 @@ def ask_question():
     try:
         answer = call_ai_llm(
             system_prompt=(
-                "You are an insightful, knowledgeable video assistant. Use the provided video summary and transcript as primary context to understand the video's topic. "
-                "First reference any relevant details mentioned in the transcript. "
-                "If a specific keyword, fact, or deeper explanation is not directly in the transcript, seamlessly expand on the topic using your own general knowledge as long as it relates to the video's subject or question—never refuse with 'the transcript does not provide this information'. "
-                "Provide clear, detailed, and helpful answers."
+                "You are a concise, intelligent video assistant. "
+                "STRICT RULE: Always answer in 1 to 2 short, direct sentences (maximum 40 words). "
+                "First use the provided video transcript and summary. "
+                "If the exact answer is not in the transcript, think and provide a relevant, accurate answer connected to the video's topic using your own knowledge. "
+                "Never say 'the transcript does not mention this' and never write more than 2 sentences."
             ),
             user_prompt=(
                 f"Video Summary:\n{(video_rec.summary or '')}\n\n"
                 f"Video Transcript:\n{transcript[:10000]}\n\n"
-                f"User Question: {question}"
+                f"Question: {question}\n\n"
+                f"Answer in 1 to 2 short sentences only:"
             ),
-            max_tokens=1500,
-            temperature=0.5,
+            max_tokens=120,
+            temperature=0.3,
         )
         if not answer:
             fallback_sents = [s for s in sent_tokenize(transcript) if any(w in s.lower() for w in question.lower().split() if len(w) > 3)]
             if fallback_sents:
-                answer = "Based on the transcript: " + " ".join(fallback_sents[:3])
+                answer = " ".join(fallback_sents[:2])
             else:
-                answer = f"Summary context: {(video_rec.summary or transcript[:400]).strip()}"
+                sents = sent_tokenize(video_rec.summary or transcript)
+                answer = " ".join(sents[:2]) if sents else (video_rec.summary or transcript)[:200]
         return jsonify({"answer": answer})
     except Exception as e:
         return jsonify({"error": str(e)}), 500

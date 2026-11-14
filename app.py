@@ -488,16 +488,29 @@ def run_pipeline(job_id, video_source, options):
             },
         )
 
-    except Exception as exc:
+   except Exception as exc:
         traceback.print_exc()
         set_job(job_id, status="error", stage="Failed", error=str(exc))
     finally:
-        for temp_file in (video_source, os.path.join(app.config['AUDIO_FOLDER'], f"{job_id}.wav")):
+        # 1. Always delete temporary audio immediately
+        audio_file = os.path.join(app.config['AUDIO_FOLDER'], f"{job_id}.wav")
+        if os.path.exists(audio_file):
             try:
-                if temp_file and os.path.exists(temp_file):
-                    os.remove(temp_file)
+                os.remove(audio_file)
             except Exception:
                 pass
+
+        # 2. Delete older videos/frames from previous runs (keep current job_id so user can play/download it)
+        for folder in (app.config['UPLOAD_FOLDER'], app.config['FRAMES_FOLDER']):
+            try:
+                for fname in os.listdir(folder):
+                    if not fname.startswith(job_id) and fname != ".gitkeep":
+                        fpath = os.path.join(folder, fname)
+                        if os.path.isfile(fpath):
+                            os.remove(fpath)
+            except Exception:
+                pass
+
         gc.collect()
         app_ctx.pop()
 

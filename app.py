@@ -1,5 +1,6 @@
 # ----------------- IMPORTS ----------------- #
 import os
+import gc
 import uuid
 import time
 import subprocess
@@ -10,8 +11,6 @@ from concurrent.futures import ThreadPoolExecutor
 from dotenv import load_dotenv
 import openai
 
-import cv2
-from faster_whisper import WhisperModel
 import nltk
 import requests
 import yt_dlp
@@ -29,7 +28,12 @@ for _pkg in ('punkt', 'punkt_tab', 'stopwords'):
 
 _env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')
 load_dotenv(_env_path)
-OPENROUTER_KEY = (os.getenv("OPENROUTER_API_KEY") or os.getenv("GROQ_API_KEY") or "").strip()
+
+GROQ_KEY = (os.getenv("GROQ_API_KEY") or "").strip()
+OPENROUTER_KEY = (os.getenv("OPENROUTER_API_KEY") or GROQ_KEY or "").strip()
+
+if not GROQ_KEY and OPENROUTER_KEY.startswith("gsk_"):
+    GROQ_KEY = OPENROUTER_KEY
 
 if OPENROUTER_KEY.startswith("gsk_"):
     AI_BASE_URL = "https://api.groq.com/openai/v1"
@@ -37,12 +41,10 @@ if OPENROUTER_KEY.startswith("gsk_"):
     print(f"[AI] Groq API key loaded OK ({OPENROUTER_KEY[:8]}...)")
 elif OPENROUTER_KEY:
     AI_BASE_URL = "https://openrouter.ai/api/v1"
-   
     AI_MODELS = [
         "openai/gpt-oss-20b",
         "openrouter/free",
     ]
-
     print(f"[AI] OpenRouter API key loaded OK ({OPENROUTER_KEY[:8]}...)")
 else:
     AI_BASE_URL = "https://openrouter.ai/api/v1"
@@ -63,7 +65,7 @@ for _folder in (app.config['UPLOAD_FOLDER'], app.config['FRAMES_FOLDER'], app.co
 
 db = SQLAlchemy(app)
 
-# ----------------- QUALITY / SPEED PRESETS (OPTIMIZED FOR U-SERIES CPU) ----------------- #
+# ----------------- QUALITY / SPEED PRESETS ----------------- #
 WHISPER_MODELS = ["tiny", "base", "small", "medium"]
 VIDEO_QUALITIES = {"480": 480, "720": 720, "1080": 1080, "best": None}
 SUMMARY_LENGTHS = {"short": 2, "medium": 4, "detailed": 7}
@@ -75,12 +77,16 @@ LANGUAGE_NAMES = {
     "de": "German", "zh": "Chinese", "ja": "Japanese", "ko": "Korean",
     "ar": "Arabic", "ru": "Russian", "pt": "Portuguese", "bn": "Bengali",
     "ta": "Tamil", "te": "Telugu", "mr": "Marathi", "ur": "Urdu",
+    "english": "English", "hindi": "Hindi", "spanish": "Spanish", "french": "French",
+    "german": "German", "chinese": "Chinese", "japanese": "Japanese", "korean": "Korean",
+    "arabic": "Arabic", "russian": "Russian", "portuguese": "Portuguese", "bengali": "Bengali",
+    "tamil": "Tamil", "telugu": "Telugu", "marathi": "Marathi", "urdu": "Urdu",
 }
 
 QUALITY_PRESETS = {
-    "fast":     {"model_size": "tiny",  "video_quality": "480",  "summary_length": "short",    "num_parts": "3", "beam_size": "1"},
-    "balanced": {"model_size": "tiny",  "video_quality": "480",  "summary_length": "medium",   "num_parts": "5", "beam_size": "1"},
-    "high":     {"model_size": "base",  "video_quality": "720",  "summary_length": "detailed", "num_parts": "5", "beam_size": "3"},
+    "fast":     {"model_size": "tiny", "video_quality": "480", "summary_length": "short",    "num_parts": "3", "beam_size": "1"},
+    "balanced": {"model_size": "tiny", "video_quality": "480", "summary_length": "medium",   "num_parts": "5", "beam_size": "1"},
+    "high":     {"model_size": "base", "video_quality": "720", "summary_length": "detailed", "num_parts": "5", "beam_size": "3"},
 }
 
 # ----------------- AI HELPER (SAFE NONETYPE HANDLING & FALLBACK) ----------------- #
@@ -142,45 +148,75 @@ def ai_summarize_part(text):
         temperature=0.3,
     )
 
-# ----------------- WHISPER MODEL CACHE (TUNED FOR U-SERIES PROCESSOR) ----------------- #
-_MODEL_CACHE = {}
-_MODEL_LOCK = threading.Lock()
-CPU_THREADS = max(2, os.cpu_count() or 4)
+# ----------------- GROQ CLOUD WHISPER TRANSCRIPTION (ZERO LOCAL RAM) ----------------- #
+def transcribe_audio_groq(audio_path, task="transcribe", progress_callback=None):
+    if not GROQ_KEY:
+        raise RuntimeError("GROQ_API_KEY is not set. Add GROQ_API_KEY in Render Environment Variables.")
 
-def get_whisper_model(size):
-    with _MODEL_LOCK:
-        if size not in _MODEL_CACHE:
-            _MODEL_CACHE[size] = WhisperModel(
-                size,
-                device="cpu",
-                compute_type="int8",
-                cpu_threads=CPU_THREADS,
-                num_workers=2,
-            )
-        return _MODEL_CACHE[size]
+    if progress_callback:
+        progress_callback(1, 4)
 
-
-def transcribe_audio(model, audio_path, task, beam_size, progress_callback=None):
-    segments_gen, info = model.transcribe(
-        audio_path,
-        task=task,
-        beam_size=beam_size,
-        best_of=1,
-        temperature=0.0,
-        condition_on_previous_text=False,
-        vad_filter=True,
-        vad_parameters=dict(min_silence_duration_ms=500),
+    compressed_mp3 = audio_path.rsplit(".", 1)[0] + "_groq.mp3"
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-i", audio_path,
+            "-vn", "-ac", "1", "-ar", "16000", "-b:a", "48k",
+            compressed_mp3,
+        ],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
     )
-    total_duration = info.duration or 0
-    segments_data = []
-    text_parts = []
-    for seg in segments_gen:
-        segments_data.append({"start": seg.start, "end": seg.end, "text": seg.text})
-        text_parts.append(seg.text)
-        if progress_callback and total_duration:
-            progress_callback(seg.end, total_duration)
-    transcript_text = "".join(text_parts).strip()
-    return transcript_text, segments_data, info.language
+
+    try:
+        if progress_callback:
+            progress_callback(2, 4)
+
+        endpoint = (
+            "https://api.groq.com/openai/v1/audio/translations"
+            if task == "translate"
+            else "https://api.groq.com/openai/v1/audio/transcriptions"
+        )
+        model_name = "whisper-large-v3" if task == "translate" else "whisper-large-v3-turbo"
+        headers = {"Authorization": f"Bearer {GROQ_KEY}"}
+        data = {
+            "model": model_name,
+            "response_format": "verbose_json",
+        }
+
+        with open(compressed_mp3, "rb") as f:
+            files = {"file": (os.path.basename(compressed_mp3), f, "audio/mpeg")}
+            resp = requests.post(endpoint, headers=headers, data=data, files=files, timeout=180)
+
+        if resp.status_code != 200:
+            raise RuntimeError(f"Groq Whisper API error ({resp.status_code}): {resp.text}")
+
+        if progress_callback:
+            progress_callback(4, 4)
+
+        payload = resp.json()
+        raw_segments = payload.get("segments") or []
+        segments_data = []
+        text_parts = []
+        for seg in raw_segments:
+            seg_text = (seg.get("text") or "").strip()
+            if seg_text:
+                segments_data.append({
+                    "start": round(float(seg.get("start", 0.0)), 2),
+                    "end": round(float(seg.get("end", 0.0)), 2),
+                    "text": seg_text,
+                })
+                text_parts.append(seg_text)
+
+        transcript_text = (payload.get("text") or "").strip() or " ".join(text_parts).strip()
+        detected_language = (payload.get("language") or "en").lower()
+        return transcript_text, segments_data, detected_language
+    finally:
+        if os.path.exists(compressed_mp3):
+            try:
+                os.remove(compressed_mp3)
+            except Exception:
+                pass
 
 
 def format_hms(seconds):
@@ -216,6 +252,7 @@ class TimestampSegment(db.Model):
     start_time = db.Column(db.Float)
     end_time = db.Column(db.Float)
     text = db.Column(db.Text)
+
 
 def migrate_schema():
     with app.app_context():
@@ -295,7 +332,7 @@ def download_video(url, job_id, height=480):
 
 def extract_audio_ffmpeg(video_path, audio_path):
     cmd = [
-        "ffmpeg", "-y", "-threads", str(CPU_THREADS), "-i", video_path,
+        "ffmpeg", "-y", "-i", video_path,
         "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
         audio_path,
     ]
@@ -321,20 +358,23 @@ def generate_summary(text, num_sentences=4):
     return " ".join(s for s in sentences if s in ranked_set)
 
 
-_CV2_LOCK = threading.Lock()
-
 def capture_frame_at_timestamp(video_path, timestamp_sec, tag):
-    with _CV2_LOCK:
-        cap = cv2.VideoCapture(video_path)
-        fps = cap.get(cv2.CAP_PROP_FPS) or 30
-        cap.set(cv2.CAP_PROP_POS_FRAMES, int(timestamp_sec * fps))
-        ret, frame = cap.read()
-        cap.release()
-        if ret:
-            filename = f"{tag}_{int(timestamp_sec)}.jpg"
-            frame_path = os.path.join(app.config['FRAMES_FOLDER'], filename)
-            cv2.imwrite(frame_path, frame)
-            return f"/static/frames/{filename}"
+    if not video_path or not os.path.exists(video_path):
+        return ""
+    filename = f"{tag}_{int(timestamp_sec)}.jpg"
+    frame_path = os.path.join(app.config['FRAMES_FOLDER'], filename)
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-ss", str(max(0.0, float(timestamp_sec))),
+            "-i", video_path,
+            "-vframes", "1", "-q:v", "4",
+            frame_path,
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    if os.path.exists(frame_path):
+        return f"/static/frames/{filename}"
     return ""
 
 
@@ -342,48 +382,29 @@ def run_pipeline(job_id, video_source, options):
     app_ctx = app.app_context()
     app_ctx.push()
     try:
-        model_size    = options["model_size"]
-        num_sentences = SUMMARY_LENGTHS[options["summary_length"]]
-        num_parts     = PART_COUNTS[options["num_parts"]]
-        beam_size     = BEAM_SIZES[options["beam_size"]]
-        task          = "translate" if options["translate_to_english"] else "transcribe"
+        num_sentences      = SUMMARY_LENGTHS[options["summary_length"]]
+        num_parts          = PART_COUNTS[options["num_parts"]]
+        task               = "translate" if options["translate_to_english"] else "transcribe"
         summary_length_key = options["summary_length"]
 
         set_job(job_id, status="running", stage="Extracting audio", progress=15)
         audio_path = os.path.join(app.config['AUDIO_FOLDER'], f"{job_id}.wav")
         extract_audio_ffmpeg(video_source, audio_path)
 
-        set_job(job_id, stage=f"Loading {model_size} model (CPU int8)", progress=25)
-        model = get_whisper_model(model_size)
+        def report_progress(step, total_steps):
+            frac = min(step / total_steps, 1.0) if total_steps else 0
+            pct  = 25 + int(frac * 35)
+            set_job(job_id, progress=pct, stage="Transcribing via Groq Cloud Whisper...")
 
-        def report_progress(current_sec, total_sec):
-            frac = min(current_sec / total_sec, 1.0) if total_sec else 0
-            pct  = 30 + int(frac * 35)
-            set_job(
-                job_id, progress=pct,
-                stage=f"Transcribing ({model_size}): {format_hms(current_sec)} / {format_hms(total_sec)}",
-            )
-
-        set_job(job_id, stage=f"Transcribing with faster-whisper ({model_size})", progress=30)
-        transcript_text, segments_data, detected_language = transcribe_audio(
-            model, audio_path, task, beam_size, progress_callback=report_progress
+        set_job(job_id, stage="Transcribing via Groq Cloud Whisper", progress=25)
+        transcript_text, segments_data, detected_language = transcribe_audio_groq(
+            audio_path, task=task, progress_callback=report_progress
         )
 
         original_transcript_text = None
         if options["keep_original_too"] and task == "translate":
-            set_job(job_id, stage="Also generating original-language transcript", progress=50)
-
-            def report_progress_2(current_sec, total_sec):
-                frac = min(current_sec / total_sec, 1.0) if total_sec else 0
-                pct  = 50 + int(frac * 10)
-                set_job(
-                    job_id, progress=pct,
-                    stage=f"Original-language transcript: {format_hms(current_sec)} / {format_hms(total_sec)}",
-                )
-
-            original_transcript_text, _, _ = transcribe_audio(
-                model, audio_path, "transcribe", beam_size, progress_callback=report_progress_2
-            )
+            set_job(job_id, stage="Also generating original-language transcript", progress=55)
+            original_transcript_text, _, _ = transcribe_audio_groq(audio_path, task="transcribe")
 
         set_job(job_id, stage="Generating AI summary", progress=68)
         summary_text = (
@@ -477,11 +498,9 @@ def run_pipeline(job_id, video_source, options):
                     os.remove(temp_file)
             except Exception:
                 pass
+        gc.collect()
         app_ctx.pop()
 
-
-# ----------------- ROUTING ENDPOINTS ----------------- #
-@app.route('/')
 
 # ----------------- ROUTING ENDPOINTS ----------------- #
 @app.route('/')

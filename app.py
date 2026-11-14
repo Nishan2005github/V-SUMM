@@ -1,8 +1,10 @@
 # ----------------- IMPORTS ----------------- #
 import os
+import re
 import gc
 import uuid
 import time
+import shutil
 import subprocess
 import threading
 import traceback
@@ -293,9 +295,60 @@ def new_job():
         }
     return job_id
 
-# ----------------- PROCESSING MODULES ----------------- #
+# ----------------- YOUTUBE COOKIE SANITIZER & MULTI-STRATEGY DOWNLOADER ----------------- #
+def _write_sanitized_cookies(raw_cookies, dest_path):
+    """Repairs Netscape cookies.txt even if Render converted tabs to spaces."""
+    lines = ["# Netscape HTTP Cookie File"]
+    for raw_line in raw_cookies.splitlines():
+        line = raw_line.strip()
+        if not line or (line.startswith("#") and not line.startswith("#HttpOnly_")):
+            continue
+        if "\t" in line:
+            parts = line.split("\t")
+        else:
+            parts = re.split(r"\s+", line, maxsplit=6)
+        if len(parts) == 7:
+            lines.append("\t".join(parts))
+        elif len(parts) == 6:
+            lines.append("\t".join(parts + [""]))
+    if len(lines) <= 1:
+        return False
+    with open(dest_path, "w", encoding="utf-8", newline="\n") as f:
+        f.write("\n".join(lines) + "\n")
+    return True
+
+
+def _locate_downloaded_file(base_no_ext, expected_mp4):
+    """Finds whatever file yt-dlp produced and converts/renames it to expected_mp4."""
+    if os.path.exists(expected_mp4) and os.path.getsize(expected_mp4) > 1000:
+        return expected_mp4
+    folder = os.path.dirname(expected_mp4)
+    prefix = os.path.basename(base_no_ext)
+    for fname in os.listdir(folder):
+        if fname.startswith(prefix) and not fname.endswith(".part"):
+            found_path = os.path.join(folder, fname)
+            if os.path.getsize(found_path) > 1000:
+                if found_path != expected_mp4:
+                    subprocess.run(
+                        ["ffmpeg", "-y", "-i", found_path, "-c", "copy", expected_mp4],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                    if not os.path.exists(expected_mp4) or os.path.getsize(expected_mp4) < 1000:
+                        shutil.move(found_path, expected_mp4)
+                    else:
+                        try:
+                            os.remove(found_path)
+                        except Exception:
+                            pass
+                return expected_mp4
+    return None
+
+
 def download_video(url, job_id, height=480):
     output_path = os.path.join(app.config['UPLOAD_FOLDER'], f"{job_id}_source.mp4")
+    base_outtmpl = os.path.join(app.config['UPLOAD_FOLDER'], f"{job_id}_source.%(ext)s")
+
     if "youtube.com" in url or "youtu.be" in url:
         clean_url = url.split("&si=")[0].split("?si=")[0]
         h = height or 480
@@ -308,34 +361,78 @@ def download_video(url, job_id, height=480):
                     pct = min(14, max(5, 5 + int((downloaded / total) * 9)))
                     set_job(job_id, progress=pct, stage=f"Downloading video ({int(downloaded * 100 / total)}%)")
 
-        ydl_opts = {
-            'format': f'bestvideo[height<={h}]+bestaudio/best[height<={h}]/bestvideo+bestaudio/best',
-            'outtmpl': output_path,
-            'quiet': True,
-            'no_warnings': True,
-            'noplaylist': True,
-            'concurrent_fragment_downloads': 4,
-            'merge_output_format': 'mp4',
-            'progress_hooks': [ydl_hook],
-        }
-
         cookies_txt = os.getenv("YOUTUBE_COOKIES", "").strip()
         cookie_file = None
         if cookies_txt:
-            cookie_file = os.path.join(app.config['AUDIO_FOLDER'], f"{job_id}_cookies.txt")
-            with open(cookie_file, "w", encoding="utf-8") as cf:
-                cf.write(cookies_txt)
-            ydl_opts['cookiefile'] = cookie_file
-        else:
-            ydl_opts['extractor_args'] = {
-                'youtube': {
-                    'player_client': ['android', 'ios', 'web'],
-                }
-            }
+            candidate_cookie = os.path.join(app.config['AUDIO_FOLDER'], f"{job_id}_cookies.txt")
+            if _write_sanitized_cookies(cookies_txt, candidate_cookie):
+                cookie_file = candidate_cookie
 
+        fmt_selector = (
+            f"bestvideo[height<={h}]+bestaudio/best[height<={h}]/"
+            f"bestvideo+bestaudio/best/b/bv*+ba*"
+        )
+
+        # Ordered fallback strategies so if one client says "Requested format is not available", the next succeeds
+        strategies = []
+        if cookie_file:
+            strategies.append({
+                "cookiefile": cookie_file,
+                "format": fmt_selector,
+                "extractor_args": {"youtube": {"player_client": ["tv_embedded", "mweb", "web"]}},
+            })
+            strategies.append({
+                "cookiefile": cookie_file,
+                "format": "best/bestvideo+bestaudio",
+            })
+        strategies.append({
+            "format": fmt_selector,
+            "extractor_args": {"youtube": {"player_client": ["ios", "android", "tv_embedded", "mweb"]}},
+        })
+        strategies.append({
+            "format": "best/bv*+ba*",
+            "extractor_args": {"youtube": {"player_client": ["tv_embedded", "ios", "web"]}},
+        })
+
+        last_err = None
         try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                ydl.download([clean_url])
+            for strat in strategies:
+                # Clean any partial file from a previous failed attempt
+                for f in os.listdir(app.config['UPLOAD_FOLDER']):
+                    if f.startswith(f"{job_id}_source"):
+                        try:
+                            os.remove(os.path.join(app.config['UPLOAD_FOLDER'], f))
+                        except Exception:
+                            pass
+
+                ydl_opts = {
+                    'outtmpl': base_outtmpl,
+                    'quiet': True,
+                    'no_warnings': True,
+                    'noplaylist': True,
+                    'geo_bypass': True,
+                    'nocheckcertificate': True,
+                    'concurrent_fragment_downloads': 4,
+                    'merge_output_format': 'mp4',
+                    'progress_hooks': [ydl_hook],
+                }
+                ydl_opts.update(strat)
+
+                try:
+                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                        ydl.download([clean_url])
+                    final_file = _locate_downloaded_file(
+                        os.path.join(app.config['UPLOAD_FOLDER'], f"{job_id}_source"),
+                        output_path,
+                    )
+                    if final_file:
+                        return final_file
+                except Exception as e:
+                    last_err = e
+                    print(f"[yt-dlp strategy retry] {e}")
+                    continue
+
+            raise RuntimeError(str(last_err) if last_err else "Could not download YouTube video.")
         finally:
             if cookie_file and os.path.exists(cookie_file):
                 try:

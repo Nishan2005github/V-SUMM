@@ -2,6 +2,7 @@
 import os
 import re
 import gc
+import json
 import uuid
 import time
 import shutil
@@ -160,6 +161,18 @@ def ai_summarize_part(text):
         temperature=0.3,
     )
 
+
+def ai_translate_to_english(text):
+    if not text:
+        return text
+    translated = call_ai_llm(
+        system_prompt="Translate the following transcript accurately into natural English. Return only the translated text.",
+        user_prompt=text[:7000],
+        max_tokens=1500,
+        temperature=0.2,
+    )
+    return translated or text
+
 # ----------------- GROQ CLOUD WHISPER TRANSCRIPTION ----------------- #
 def transcribe_audio_groq(audio_path, task="transcribe", progress_callback=None):
     if not GROQ_KEY:
@@ -305,24 +318,12 @@ def new_job():
         }
     return job_id
 
-# ----------------- YOUTUBE COOKIE & DYNAMIC FORMAT ENGINE ----------------- #
-def _prepare_cookie_file(job_id):
-    dest_cookie = os.path.join(app.config['AUDIO_FOLDER'], f"{job_id}_cookies.txt")
-
-    for secret_path in ("/etc/secrets/cookies.txt", os.path.join(BASE_DIR, "cookies.txt")):
-        if os.path.exists(secret_path) and os.path.getsize(secret_path) > 20:
-            with open(secret_path, "r", encoding="utf-8", errors="ignore") as src:
-                raw_text = src.read()
-            if _write_clean_netscape_cookies(raw_text, dest_cookie):
-                print(f"[Cookies] Loaded & sanitized Secret File from {secret_path}")
-                return dest_cookie
-
-    raw_env = os.getenv("YOUTUBE_COOKIES", "").strip()
-    if raw_env and _write_clean_netscape_cookies(raw_env, dest_cookie):
-        print("[Cookies] Loaded & sanitized YOUTUBE_COOKIES env var")
-        return dest_cookie
-
-    return None
+# ----------------- YOUTUBE ENGINE (COOKIES + SUBTITLES + VIDEO) ----------------- #
+def extract_youtube_id(url):
+    if not url:
+        return None
+    m = re.search(r"(?:v=|youtu\.be/|embed/|shorts/)([A-Za-z0-9_-]{11})", url)
+    return m.group(1) if m else None
 
 
 def _write_clean_netscape_cookies(raw_text, dest_path):
@@ -344,13 +345,28 @@ def _write_clean_netscape_cookies(raw_text, dest_path):
     return True
 
 
+def _prepare_cookie_file(job_id):
+    dest_cookie = os.path.join(app.config['AUDIO_FOLDER'], f"{job_id}_cookies.txt")
+    for secret_path in ("/etc/secrets/cookies.txt", os.path.join(BASE_DIR, "cookies.txt")):
+        if os.path.exists(secret_path) and os.path.getsize(secret_path) > 20:
+            with open(secret_path, "r", encoding="utf-8", errors="ignore") as src:
+                raw_text = src.read()
+            if _write_clean_netscape_cookies(raw_text, dest_cookie):
+                return dest_cookie
+
+    raw_env = os.getenv("YOUTUBE_COOKIES", "").strip()
+    if raw_env and _write_clean_netscape_cookies(raw_env, dest_cookie):
+        return dest_cookie
+    return None
+
+
 def _locate_downloaded_file(base_no_ext, expected_mp4):
     if os.path.exists(expected_mp4) and os.path.getsize(expected_mp4) > 10000:
         return expected_mp4
     folder = os.path.dirname(expected_mp4)
     prefix = os.path.basename(base_no_ext)
     for fname in os.listdir(folder):
-        if fname.startswith(prefix) and not fname.endswith(".part"):
+        if fname.startswith(prefix) and not fname.endswith((".part", ".ytdl", ".json3", ".vtt", ".srv1")):
             found_path = os.path.join(folder, fname)
             if os.path.getsize(found_path) > 10000:
                 if found_path != expected_mp4:
@@ -370,68 +386,190 @@ def _locate_downloaded_file(base_no_ext, expected_mp4):
     return None
 
 
-def _pick_best_available_format_id(info, max_height=480):
-    """Inspects whatever formats YouTube actually returned and picks a real format_id."""
-    formats = info.get("formats") or []
-    valid = [
-        f for f in formats
-        if f.get("format_id")
-        and f.get("url")
-        and f.get("protocol") not in ("mhtml",)
-        and f.get("ext") not in ("mhtml",)
-    ]
-    if not valid:
-        return None
-
-    # 1. Prefer combined video+audio stream <= max_height
-    combined = [
-        f for f in valid
-        if f.get("vcodec") not in (None, "none") and f.get("acodec") not in (None, "none")
-    ]
-    if combined:
-        under_h = [f for f in combined if (f.get("height") or 0) <= max_height]
-        chosen = (under_h or combined)[-1]
-        return str(chosen["format_id"])
-
-    # 2. Separate video + audio streams
-    v_only = [f for f in valid if f.get("vcodec") not in (None, "none")]
-    a_only = [f for f in valid if f.get("acodec") not in (None, "none") and f.get("vcodec") in (None, "none")]
-    if v_only and a_only:
-        v_under = [f for f in v_only if (f.get("height") or 0) <= max_height]
-        v_chosen = (v_under or v_only)[-1]
-        a_chosen = a_only[-1]
-        return f"{v_chosen['format_id']}+{a_chosen['format_id']}"
-
-    # 3. Any playable stream at all
-    return str(valid[-1]["format_id"])
+def _parse_json3_subtitles(json3_path):
+    """Parses yt-dlp json3 subtitle file into clean segments."""
+    try:
+        with open(json3_path, "r", encoding="utf-8", errors="ignore") as f:
+            data = json.load(f)
+        events = data.get("events") or []
+        segments = []
+        texts = []
+        for ev in events:
+            segs = ev.get("segs")
+            if not segs:
+                continue
+            txt = "".join(s.get("utf8", "") for s in segs).replace("\n", " ").strip()
+            if not txt:
+                continue
+            start_sec = round(float(ev.get("tStartMs", 0)) / 1000.0, 2)
+            dur_sec = round(float(ev.get("dDurationMs", 2500)) / 1000.0, 2)
+            segments.append({"start": start_sec, "end": round(start_sec + dur_sec, 2), "text": txt})
+            texts.append(txt)
+        if segments:
+            return " ".join(texts).strip(), segments
+    except Exception as e:
+        print(f"[json3 parse] {e}")
+    return None, None
 
 
-def _download_with_pytubefix(clean_url, output_path):
-    if PyTubeYouTube is None:
-        return None
-    for client_name in ("WEB", "ANDROID_VR", "MWEB", "IOS", "TV_EMBED", "WEB_EMBED"):
+def fetch_real_youtube_transcript(clean_url, yt_id, job_id, cookie_file=None, task="transcribe"):
+    """Fetches the real spoken transcript of a YouTube video using 3 independent methods."""
+    # Method 1: yt-dlp subtitle extraction (--write-subs / --write-auto-subs with cookies)
+    sub_base = os.path.join(app.config['AUDIO_FOLDER'], f"{job_id}_sub")
+    for client_list in (["web", "mweb"], ["ios", "android_vr", "tv"], None):
         try:
-            yt = PyTubeYouTube(clean_url, client=client_name)
-            stream = (
-                yt.streams.filter(progressive=True, file_extension="mp4")
-                .order_by("resolution")
-                .desc()
-                .first()
-                or yt.streams.filter(file_extension="mp4").first()
-                or yt.streams.first()
-            )
-            if stream:
-                stream.download(
-                    output_path=os.path.dirname(output_path),
-                    filename=os.path.basename(output_path),
-                )
-                if os.path.exists(output_path) and os.path.getsize(output_path) > 10000:
-                    print(f"[pytubefix] Downloaded via {client_name}")
-                    return output_path
+            ydl_opts = {
+                'skip_download': True,
+                'writesubtitles': True,
+                'writeautomaticsub': True,
+                'subtitleslangs': ['en.*', 'en', 'hi', 'bn', 'es', 'fr', 'de', 'ja', 'ko', 'pt', 'ru', 'ar'],
+                'subtitlesformat': 'json3',
+                'outtmpl': sub_base,
+                'quiet': True,
+                'no_warnings': True,
+                'ignore_no_formats_error': True,
+            }
+            if cookie_file:
+                ydl_opts['cookiefile'] = cookie_file
+            if client_list:
+                ydl_opts['extractor_args'] = {'youtube': {'player_client': client_list}}
+
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(clean_url, download=True)
+                detected_lang = (info.get("language") or "en").split("-")[0].lower()
+
+            for fname in os.listdir(app.config['AUDIO_FOLDER']):
+                if fname.startswith(f"{job_id}_sub") and fname.endswith(".json3"):
+                    fpath = os.path.join(app.config['AUDIO_FOLDER'], fname)
+                    full_txt, segs = _parse_json3_subtitles(fpath)
+                    try:
+                        os.remove(fpath)
+                    except Exception:
+                        pass
+                    if full_txt and segs:
+                        if task == "translate" and detected_lang != "en":
+                            full_txt = ai_translate_to_english(full_txt)
+                        return full_txt, segs, detected_lang
         except Exception as e:
-            print(f"[pytubefix {client_name}] {e}")
+            print(f"[yt-dlp subtitle extract] {e}")
             continue
-    return None
+
+    # Method 2: youtube-transcript-api (with cookies if available)
+    if YouTubeTranscriptApi is not None and yt_id:
+        try:
+            if hasattr(YouTubeTranscriptApi, "list_transcripts"):
+                t_list = (
+                    YouTubeTranscriptApi.list_transcripts(yt_id, cookies=cookie_file)
+                    if cookie_file else YouTubeTranscriptApi.list_transcripts(yt_id)
+                )
+                chosen = None
+                for tr in t_list:
+                    chosen = tr
+                    if tr.language_code.startswith("en"):
+                        break
+                if chosen:
+                    lang = chosen.language_code.split("-")[0].lower()
+                    raw_items = chosen.fetch()
+                    segments, texts = [], []
+                    for item in raw_items:
+                        s = float(item.get("start", 0.0) if isinstance(item, dict) else getattr(item, "start", 0.0))
+                        d = float(item.get("duration", 2.5) if isinstance(item, dict) else getattr(item, "duration", 2.5))
+                        txt = (item.get("text", "") if isinstance(item, dict) else getattr(item, "text", "")).replace("\n", " ").strip()
+                        if txt:
+                            segments.append({"start": round(s, 2), "end": round(s + d, 2), "text": txt})
+                            texts.append(txt)
+                    if segments:
+                        full_txt = " ".join(texts).strip()
+                        if task == "translate" and lang != "en":
+                            full_txt = ai_translate_to_english(full_txt)
+                        return full_txt, segments, lang
+            else:
+                api_inst = YouTubeTranscriptApi()
+                fetched = api_inst.fetch(yt_id)
+                segments, texts = [], []
+                for snippet in fetched:
+                    s = float(getattr(snippet, "start", 0.0))
+                    d = float(getattr(snippet, "duration", 2.5))
+                    txt = str(getattr(snippet, "text", "")).replace("\n", " ").strip()
+                    if txt:
+                        segments.append({"start": round(s, 2), "end": round(s + d, 2), "text": txt})
+                        texts.append(txt)
+                if segments:
+                    return " ".join(texts).strip(), segments, "en"
+        except Exception as e:
+            print(f"[youtube_transcript_api] {e}")
+
+    # Method 3: pytubefix captions
+    if PyTubeYouTube is not None:
+        for client_name in ("WEB", "ANDROID_VR", "MWEB", "IOS", "TV_EMBED"):
+            try:
+                yt = PyTubeYouTube(clean_url, client=client_name)
+                if yt.captions:
+                    cap = yt.captions.get("en") or yt.captions.get("a.en") or list(yt.captions)[0]
+                    xml_str = cap.xml_captions
+                    matches = re.findall(r'start="([\d.]+)"\s+dur="([\d.]+)"[^>]*>(.*?)</text>', xml_str, re.DOTALL)
+                    segments, texts = [], []
+                    for s_str, d_str, raw_t in matches:
+                        clean_t = re.sub(r"<[^>]+>", "", raw_t).replace("&#39;", "'").replace("&quot;", '"').replace("\n", " ").strip()
+                        if clean_t:
+                            s_val, d_val = float(s_str), float(d_str)
+                            segments.append({"start": round(s_val, 2), "end": round(s_val + d_val, 2), "text": clean_t})
+                            texts.append(clean_t)
+                    if segments:
+                        return " ".join(texts).strip(), segments, "en"
+            except Exception:
+                continue
+
+    return None, None, None
+
+
+def _build_storyboard_video_from_youtube(yt_id, output_path, total_duration=120):
+    """Downloads multi-angle YouTube thumbnails (hq1, hq2, hq3, maxresdefault) to build a playable video when raw video stream is IP-blocked."""
+    img_paths = []
+    for idx, img_name in enumerate(("maxresdefault.jpg", "hq1.jpg", "hq2.jpg", "hq3.jpg", "sddefault.jpg")):
+        try:
+            r = requests.get(f"https://i.ytimg.com/vi/{yt_id}/{img_name}", timeout=8)
+            if r.status_code == 200 and len(r.content) > 2000:
+                p = os.path.join(app.config['AUDIO_FOLDER'], f"{yt_id}_{idx}.jpg")
+                with open(p, "wb") as f:
+                    f.write(r.content)
+                img_paths.append(p)
+        except Exception:
+            continue
+
+    if not img_paths:
+        return None
+
+    dur = max(15, min(int(total_duration or 120), 600))
+    seg_dur = max(3, dur // len(img_paths))
+    concat_txt = os.path.join(app.config['AUDIO_FOLDER'], f"{yt_id}_concat.txt")
+    try:
+        with open(concat_txt, "w", encoding="utf-8") as cf:
+            for p in img_paths:
+                escaped_p = p.replace("'", "'\\''")
+                cf.write(f"file '{escaped_p}'\n")
+                cf.write(f"duration {seg_dur}\n")
+            escaped_last = img_paths[-1].replace("'", "'\\''")
+            cf.write(f"file '{escaped_last}'\n")
+
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_txt,
+                "-vf", "scale=640:360:force_original_aspect_ratio=decrease,pad=640:360:(ow-iw)/2:(oh-ih)/2,format=yuv420p",
+                "-r", "1", "-c:v", "libx264", "-preset", "ultrafast",
+                output_path,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    finally:
+        for p in img_paths + [concat_txt]:
+            if os.path.exists(p):
+                try:
+                    os.remove(p)
+                except Exception:
+                    pass
+    return output_path if os.path.exists(output_path) else None
 
 
 def download_video(url, job_id, height=480):
@@ -452,15 +590,13 @@ def download_video(url, job_id, height=480):
 
         cookie_file = _prepare_cookie_file(job_id)
 
-        # Client profiles ordered from least-restricted to most-compatible with cookies
+        # Profiles that support HLS (.m3u8), DASH, and progressive formats
         profiles = [
-            {"clients": ["tv", "web_embedded", "mweb"], "use_cookie": True},
-            {"clients": ["mweb", "tv_embedded", "ios"], "use_cookie": True},
-            {"clients": ["android_vr", "tv", "web_embedded", "ios"], "use_cookie": False},
-            {"clients": None, "use_cookie": True},
+            {"clients": ["web_creator", "tv", "mweb"], "use_cookie": True},
+            {"clients": ["ios", "android_vr", "tv_embedded", "mweb"], "use_cookie": False},
+            {"clients": ["mweb", "web"], "use_cookie": True},
         ]
 
-        last_error = None
         try:
             for prof in profiles:
                 if prof["use_cookie"] and not cookie_file:
@@ -473,59 +609,56 @@ def download_video(url, job_id, height=480):
                         except Exception:
                             pass
 
-                base_opts = {
+                ydl_opts = {
+                    'format': f'bestvideo[height<={h}]+bestaudio/best[height<={h}]/bestvideo+bestaudio/best/b/bv*+ba*',
                     'outtmpl': base_outtmpl,
                     'quiet': True,
                     'no_warnings': True,
                     'noplaylist': True,
                     'geo_bypass': True,
                     'nocheckcertificate': True,
-                    'ignore_no_formats_error': True,
                     'concurrent_fragment_downloads': 4,
                     'merge_output_format': 'mp4',
                     'progress_hooks': [ydl_hook],
                 }
                 if prof["use_cookie"] and cookie_file:
-                    base_opts['cookiefile'] = cookie_file
+                    ydl_opts['cookiefile'] = cookie_file
                 if prof["clients"]:
-                    base_opts['extractor_args'] = {'youtube': {'player_client': prof["clients"]}}
+                    ydl_opts['extractor_args'] = {'youtube': {'player_client': prof["clients"]}}
 
                 try:
-                    # Step A: Extract metadata without failing on format selection
-                    with yt_dlp.YoutubeDL(base_opts) as ydl:
-                        info = ydl.extract_info(clean_url, download=False)
-
-                    chosen_fmt = _pick_best_available_format_id(info or {}, max_height=h)
-                    if not chosen_fmt:
-                        print(f"[yt-dlp] No playable formats returned for profile {prof['clients']}")
-                        continue
-
-                    # Step B: Download the exact format_id discovered in Step A
-                    dl_opts = dict(base_opts)
-                    dl_opts.pop('ignore_no_formats_error', None)
-                    dl_opts['format'] = chosen_fmt
-                    print(f"[yt-dlp] Downloading exact format_id={chosen_fmt} via {prof['clients']}")
-
-                    with yt_dlp.YoutubeDL(dl_opts) as ydl_dl:
-                        ydl_dl.download([clean_url])
+                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                        ydl.download([clean_url])
 
                     final_file = _locate_downloaded_file(
                         os.path.join(app.config['UPLOAD_FOLDER'], f"{job_id}_source"),
                         output_path,
                     )
                     if final_file:
-                        return final_file
+                        return final_file, True
                 except Exception as e:
-                    last_error = e
-                    print(f"[yt-dlp profile retry] {e}")
+                    print(f"[yt-dlp download retry] {e}")
                     continue
 
-            # Fallback to pytubefix multi-client downloader
-            pt_res = _download_with_pytubefix(clean_url, output_path)
-            if pt_res:
-                return pt_res
+            # Try pytubefix if yt-dlp video stream was blocked
+            if PyTubeYouTube is not None:
+                for client_name in ("ANDROID_VR", "MWEB", "IOS", "WEB", "TV_EMBED"):
+                    try:
+                        yt = PyTubeYouTube(clean_url, client=client_name)
+                        stream = (
+                            yt.streams.filter(progressive=True, file_extension="mp4").order_by("resolution").desc().first()
+                            or yt.streams.filter(file_extension="mp4").first()
+                            or yt.streams.first()
+                        )
+                        if stream:
+                            stream.download(output_path=os.path.dirname(output_path), filename=os.path.basename(output_path))
+                            if os.path.exists(output_path) and os.path.getsize(output_path) > 10000:
+                                return output_path, True
+                    except Exception:
+                        continue
 
-            raise RuntimeError(str(last_error) if last_error else "No playable formats returned by YouTube.")
+            # Return (None, False) so run_pipeline uses direct YouTube captions + multi-scene storyboard instead of failing
+            return None, False
         finally:
             if cookie_file and os.path.exists(cookie_file):
                 try:
@@ -539,7 +672,7 @@ def download_video(url, job_id, height=480):
                 for chunk in response.iter_content(chunk_size=1024 * 1024):
                     if chunk:
                         f.write(chunk)
-    return output_path
+        return output_path, True
 
 
 def extract_audio_ffmpeg(video_path, audio_path):
@@ -590,33 +723,66 @@ def capture_frame_at_timestamp(video_path, timestamp_sec, tag):
     return ""
 
 
-def run_pipeline(job_id, video_source, options):
+def run_pipeline(job_id, video_source, options, youtube_url=None, has_real_video=True):
     app_ctx = app.app_context()
     app_ctx.push()
+    cookie_file = None
     try:
         num_sentences      = SUMMARY_LENGTHS[options["summary_length"]]
         num_parts          = PART_COUNTS[options["num_parts"]]
         task               = "translate" if options["translate_to_english"] else "transcribe"
         summary_length_key = options["summary_length"]
+        clean_url          = youtube_url.split("&si=")[0].split("?si=")[0] if youtube_url else None
+        yt_id              = extract_youtube_id(clean_url) if clean_url else None
 
-        set_job(job_id, status="running", stage="Extracting audio", progress=15)
-        audio_path = os.path.join(app.config['AUDIO_FOLDER'], f"{job_id}.wav")
-        extract_audio_ffmpeg(video_source, audio_path)
-
-        def report_progress(step, total_steps):
-            frac = min(step / total_steps, 1.0) if total_steps else 0
-            pct  = 25 + int(frac * 35)
-            set_job(job_id, progress=pct, stage="Transcribing via Groq Cloud Whisper...")
-
-        set_job(job_id, stage="Transcribing via Groq Cloud Whisper", progress=25)
-        transcript_text, segments_data, detected_language = transcribe_audio_groq(
-            audio_path, task=task, progress_callback=report_progress
-        )
-
+        transcript_text = None
+        segments_data = None
+        detected_language = "en"
         original_transcript_text = None
-        if options["keep_original_too"] and task == "translate":
-            set_job(job_id, stage="Also generating original-language transcript", progress=55)
-            original_transcript_text, _, _ = transcribe_audio_groq(audio_path, task="transcribe")
+
+        # 1. If we downloaded a real video file with audio, transcribe it via Groq Cloud Whisper
+        if has_real_video and video_source and os.path.exists(video_source):
+            try:
+                set_job(job_id, status="running", stage="Extracting audio", progress=15)
+                audio_path = os.path.join(app.config['AUDIO_FOLDER'], f"{job_id}.wav")
+                extract_audio_ffmpeg(video_source, audio_path)
+
+                def report_progress(step, total_steps):
+                    frac = min(step / total_steps, 1.0) if total_steps else 0
+                    pct  = 25 + int(frac * 35)
+                    set_job(job_id, progress=pct, stage="Transcribing via Groq Cloud Whisper...")
+
+                set_job(job_id, stage="Transcribing via Groq Cloud Whisper", progress=25)
+                transcript_text, segments_data, detected_language = transcribe_audio_groq(
+                    audio_path, task=task, progress_callback=report_progress
+                )
+
+                if options["keep_original_too"] and task == "translate":
+                    set_job(job_id, stage="Also generating original-language transcript", progress=55)
+                    original_transcript_text, _, _ = transcribe_audio_groq(audio_path, task="transcribe")
+            except Exception as whisper_err:
+                print(f"[Whisper fallback to captions] {whisper_err}")
+
+        # 2. If YouTube blocked the raw video stream on Render's IP, get the REAL transcript from YouTube Captions
+        if (not transcript_text or not segments_data) and yt_id:
+            set_job(job_id, status="running", stage="Fetching real YouTube transcript...", progress=30)
+            cookie_file = _prepare_cookie_file(job_id)
+            transcript_text, segments_data, detected_language = fetch_real_youtube_transcript(
+                clean_url, yt_id, job_id, cookie_file=cookie_file, task=task
+            )
+            if options["keep_original_too"] and task == "translate" and transcript_text:
+                orig_txt, _, _ = fetch_real_youtube_transcript(
+                    clean_url, yt_id, job_id, cookie_file=cookie_file, task="transcribe"
+                )
+                original_transcript_text = orig_txt
+
+            if not video_source or not os.path.exists(video_source):
+                est_dur = segments_data[-1]["end"] if segments_data else 120
+                video_source = os.path.join(app.config['UPLOAD_FOLDER'], f"{job_id}_source.mp4")
+                _build_storyboard_video_from_youtube(yt_id, video_source, total_duration=est_dur)
+
+        if not transcript_text or not segments_data:
+            raise RuntimeError("Could not extract transcript or audio from this YouTube video.")
 
         set_job(job_id, stage="Generating AI summary", progress=68)
         summary_text = (
@@ -626,7 +792,7 @@ def run_pipeline(job_id, video_source, options):
 
         video_rec = VideoRecord(
             title="Processed Video",
-            video_path=f"/static/uploads/{os.path.basename(video_source)}",
+            video_path=f"/static/uploads/{os.path.basename(video_source)}" if video_source else "",
             transcript=transcript_text,
             summary=summary_text,
             detected_language=detected_language,
@@ -704,12 +870,15 @@ def run_pipeline(job_id, video_source, options):
         traceback.print_exc()
         set_job(job_id, status="error", stage="Failed", error=str(exc))
     finally:
-        audio_file = os.path.join(app.config['AUDIO_FOLDER'], f"{job_id}.wav")
-        if os.path.exists(audio_file):
-            try:
-                os.remove(audio_file)
-            except Exception:
-                pass
+        for temp_f in (
+            os.path.join(app.config['AUDIO_FOLDER'], f"{job_id}.wav"),
+            cookie_file,
+        ):
+            if temp_f and os.path.exists(temp_f):
+                try:
+                    os.remove(temp_f)
+                except Exception:
+                    pass
 
         for folder in (app.config['UPLOAD_FOLDER'], app.config['FRAMES_FOLDER']):
             try:
@@ -765,8 +934,8 @@ def process_video():
     def worker():
         try:
             set_job(job_id, status="running", stage="Downloading video", progress=5)
-            video_source = download_video(url, job_id, VIDEO_QUALITIES[options["video_quality"]])
-            run_pipeline(job_id, video_source, options)
+            video_source, has_real_video = download_video(url, job_id, VIDEO_QUALITIES[options["video_quality"]])
+            run_pipeline(job_id, video_source, options, youtube_url=url, has_real_video=has_real_video)
         except Exception as exc:
             traceback.print_exc()
             set_job(job_id, status="error", stage="Failed", error=str(exc))
@@ -775,7 +944,11 @@ def process_video():
         video_source = os.path.join(app.config['UPLOAD_FOLDER'], f"{job_id}_uploaded.mp4")
         file.save(video_source)
         set_job(job_id, status="running", stage="Uploaded, starting pipeline", progress=8)
-        threading.Thread(target=run_pipeline, args=(job_id, video_source, options), daemon=True).start()
+        threading.Thread(
+            target=run_pipeline,
+            args=(job_id, video_source, options, None, True),
+            daemon=True,
+        ).start()
     else:
         threading.Thread(target=worker, daemon=True).start()
 

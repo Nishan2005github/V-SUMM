@@ -1,0 +1,10 @@
+flask
+flask-sqlalchemy
+opencv-python
+faster-whisper
+nltk
+numpy
+requests
+yt-dlp
+python-dotenv
+openai

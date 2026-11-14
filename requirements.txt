@@ -3,6 +3,6 @@ flask-sqlalchemy
 nltk
 numpy
 requests
-yt-dlp
+yt-dlp[default]
 python-dotenv
 openai

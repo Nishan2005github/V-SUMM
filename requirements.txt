@@ -3,6 +3,7 @@ flask-sqlalchemy
 nltk
 numpy
 requests
-yt-dlp[default]
+yt-dlp
 python-dotenv
 openai
+youtube-transcript-api

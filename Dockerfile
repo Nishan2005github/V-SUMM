@@ -9,7 +9,7 @@ ENV HOME=/home/user PATH=/home/user/.local/bin:$PATH
 WORKDIR $HOME/app
 
 COPY --chown=user requirements.txt .
-RUN pip install --no-cache-dir -U pip yt-dlp && pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -U pip && pip install --no-cache-dir -U -r requirements.txt
 
 COPY --chown=user . .
 RUN mkdir -p static/uploads static/frames static/audio

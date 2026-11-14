@@ -8,7 +8,6 @@ import shutil
 import subprocess
 import threading
 import traceback
-from urllib.parse import urlparse, parse_qs
 from concurrent.futures import ThreadPoolExecutor
 
 from dotenv import load_dotenv
@@ -22,6 +21,11 @@ from flask_sqlalchemy import SQLAlchemy
 from nltk.tokenize import sent_tokenize, word_tokenize
 from nltk.corpus import stopwords
 from collections import Counter
+
+try:
+    from pytubefix import YouTube as PyTubeYouTube
+except ImportError:
+    PyTubeYouTube = None
 
 try:
     from youtube_transcript_api import YouTubeTranscriptApi
@@ -97,7 +101,7 @@ QUALITY_PRESETS = {
     "high":     {"model_size": "base", "video_quality": "720", "summary_length": "detailed", "num_parts": "5", "beam_size": "3"},
 }
 
-# ----------------- AI HELPER (SAFE NONETYPE HANDLING & FALLBACK) ----------------- #
+# ----------------- AI HELPER ----------------- #
 def call_ai_llm(system_prompt, user_prompt, max_tokens=800, temperature=0.3):
     if not OPENROUTER_KEY:
         return None
@@ -156,19 +160,7 @@ def ai_summarize_part(text):
         temperature=0.3,
     )
 
-
-def ai_translate_to_english(text):
-    if not text:
-        return text
-    translated = call_ai_llm(
-        system_prompt="Translate the following transcript accurately into natural English. Return only the English translation.",
-        user_prompt=text[:7000],
-        max_tokens=1500,
-        temperature=0.2,
-    )
-    return translated or text
-
-# ----------------- GROQ CLOUD WHISPER TRANSCRIPTION (ZERO LOCAL RAM) ----------------- #
+# ----------------- GROQ CLOUD WHISPER TRANSCRIPTION ----------------- #
 def transcribe_audio_groq(audio_path, task="transcribe", progress_callback=None):
     if not GROQ_KEY:
         raise RuntimeError("GROQ_API_KEY is not set. Add GROQ_API_KEY in Render Environment Variables.")
@@ -313,7 +305,7 @@ def new_job():
         }
     return job_id
 
-# ----------------- YOUTUBE ID, CAPTION & MIRROR FALLBACK ENGINE ----------------- #
+# ----------------- REAL YOUTUBE VIDEO DOWNLOADER (MULTI-ENGINE) ----------------- #
 def extract_youtube_id(url):
     if not url:
         return None
@@ -340,21 +332,21 @@ def _write_sanitized_cookies(raw_cookies, dest_path):
 
 
 def _locate_downloaded_file(base_no_ext, expected_mp4):
-    if os.path.exists(expected_mp4) and os.path.getsize(expected_mp4) > 1000:
+    if os.path.exists(expected_mp4) and os.path.getsize(expected_mp4) > 10000:
         return expected_mp4
     folder = os.path.dirname(expected_mp4)
     prefix = os.path.basename(base_no_ext)
     for fname in os.listdir(folder):
         if fname.startswith(prefix) and not fname.endswith(".part"):
             found_path = os.path.join(folder, fname)
-            if os.path.getsize(found_path) > 1000:
+            if os.path.getsize(found_path) > 10000:
                 if found_path != expected_mp4:
                     subprocess.run(
                         ["ffmpeg", "-y", "-i", found_path, "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac", expected_mp4],
                         stdout=subprocess.DEVNULL,
                         stderr=subprocess.DEVNULL,
                     )
-                    if not os.path.exists(expected_mp4) or os.path.getsize(expected_mp4) < 1000:
+                    if not os.path.exists(expected_mp4) or os.path.getsize(expected_mp4) < 10000:
                         shutil.move(found_path, expected_mp4)
                     else:
                         try:
@@ -365,180 +357,86 @@ def _locate_downloaded_file(base_no_ext, expected_mp4):
     return None
 
 
-def _download_via_piped_or_invidious(yt_id, output_path):
-    """Downloads MP4 stream from public Piped / Invidious APIs when Render IP is blocked by YouTube."""
-    piped_apis = [
-        "https://pipedapi.kavin.rocks",
-        "https://pipedapi.tokhmi.xyz",
-        "https://pipedapi.moomoo.me",
-        "https://api.piped.projectsegfau.lt",
-    ]
-    for api in piped_apis:
+def _download_with_pytubefix(clean_url, output_path):
+    """Engine 2: Uses pytubefix with ANDROID_VR / MWEB /TV clients which bypass yt-dlp format blocks."""
+    if PyTubeYouTube is None:
+        return None
+    for client_name in ("ANDROID_VR", "MWEB", "IOS", "WEB_EMBED", "TV"):
         try:
-            r = requests.get(f"{api}/streams/{yt_id}", timeout=12)
-            if r.status_code == 200:
-                data = r.json()
-                streams = [s for s in (data.get("videoStreams") or []) if not s.get("videoOnly") and s.get("url")]
-                if not streams:
-                    streams = [s for s in (data.get("audioStreams") or []) if s.get("url")]
-                if streams:
-                    stream_url = streams[0]["url"]
-                    with requests.get(stream_url, stream=True, timeout=60) as sr:
-                        sr.raise_for_status()
-                        with open(output_path, "wb") as f:
-                            for chunk in sr.iter_content(chunk_size=512 * 1024):
-                                if chunk:
-                                    f.write(chunk)
-                    if os.path.exists(output_path) and os.path.getsize(output_path) > 5000:
-                        return output_path
-        except Exception:
-            continue
-
-    invidious_apis = [
-        "https://inv.tux.pizza",
-        "https://invidious.nerdvpn.de",
-        "https://invidious.jing.rocks",
-        "https://yt.artemislena.eu",
-    ]
-    for api in invidious_apis:
-        try:
-            r = requests.get(f"{api}/api/v1/videos/{yt_id}", timeout=12)
-            if r.status_code == 200:
-                data = r.json()
-                fmt_streams = data.get("formatStreams") or []
-                for fs in fmt_streams:
-                    s_url = fs.get("url")
-                    if s_url:
-                        with requests.get(s_url, stream=True, timeout=60) as sr:
-                            sr.raise_for_status()
-                            with open(output_path, "wb") as f:
-                                for chunk in sr.iter_content(chunk_size=512 * 1024):
-                                    if chunk:
-                                        f.write(chunk)
-                        if os.path.exists(output_path) and os.path.getsize(output_path) > 5000:
-                            return output_path
-        except Exception:
+            yt = PyTubeYouTube(clean_url, client=client_name)
+            stream = (
+                yt.streams.filter(progressive=True, file_extension="mp4")
+                .order_by("resolution")
+                .desc()
+                .first()
+            )
+            if not stream:
+                stream = yt.streams.filter(file_extension="mp4").first() or yt.streams.first()
+            if stream:
+                tmp_dir = os.path.dirname(output_path)
+                tmp_name = os.path.basename(output_path)
+                stream.download(output_path=tmp_dir, filename=tmp_name)
+                if os.path.exists(output_path) and os.path.getsize(output_path) > 10000:
+                    return output_path
+        except Exception as e:
+            print(f"[pytubefix {client_name} retry] {e}")
             continue
     return None
 
 
-def _generate_fallback_video_from_thumbnail(yt_id, output_path, duration_sec=60):
-    """Creates a valid playable MP4 from the official YouTube HD thumbnail if YouTube blocks raw video streams."""
-    thumb_path = output_path.rsplit(".", 1)[0] + "_thumb.jpg"
-    for res in ("maxresdefault.jpg", "sddefault.jpg", "hqdefault.jpg"):
+def _download_via_active_mirrors(yt_id, clean_url, output_path):
+    """Engine 3: Downloads real MP4 stream from active Piped / Invidious / Cobalt instances."""
+    piped_apis = [
+        "https://pipedapi.adminforge.de",
+        "https://pipedapi.drgns.space",
+        "https://pipedapi.smnz.de",
+        "https://pipedapi.leptons.xyz",
+        "https://pipedapi.nosebs.ru",
+    ]
+    for api in piped_apis:
         try:
-            r = requests.get(f"https://i.ytimg.com/vi/{yt_id}/{res}", timeout=10)
-            if r.status_code == 200 and len(r.content) > 2000:
-                with open(thumb_path, "wb") as f:
-                    f.write(r.content)
-                break
-        except Exception:
-            continue
-
-    dur = max(10, min(int(duration_sec or 60), 600))
-    try:
-        if os.path.exists(thumb_path):
-            subprocess.run(
-                [
-                    "ffmpeg", "-y", "-loop", "1", "-framerate", "1", "-i", thumb_path,
-                    "-f", "lavfi", "-i", "anullsrc=channel_layout=mono:sample_rate=16000",
-                    "-t", str(dur),
-                    "-c:v", "libx264", "-preset", "ultrafast", "-tune", "stillimage",
-                    "-vf", "scale=640:360:force_original_aspect_ratio=decrease,pad=640:360:(ow-iw)/2:(oh-ih)/2",
-                    "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest",
-                    output_path,
-                ],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-    finally:
-        if os.path.exists(thumb_path):
-            try:
-                os.remove(thumb_path)
-            except Exception:
-                pass
-    return output_path if os.path.exists(output_path) else None
-
-
-def fetch_youtube_captions_fallback(yt_id, task="transcribe"):
-    """Fetches timestamped transcript directly from YouTube Caption API or Piped/Invidious."""
-    if not yt_id:
-        return None, None, None
-
-    # 1. Try youtube-transcript-api (both newer v1.x and v0.6.x interfaces)
-    if YouTubeTranscriptApi is not None:
-        try:
-            if hasattr(YouTubeTranscriptApi, "list_transcripts"):
-                t_list = YouTubeTranscriptApi.list_transcripts(yt_id)
-                transcript_obj = None
-                for tr in t_list:
-                    transcript_obj = tr
-                    if tr.language_code.startswith("en"):
-                        break
-                if transcript_obj:
-                    lang = transcript_obj.language_code.split("-")[0].lower()
-                    if task == "translate" and lang != "en" and transcript_obj.is_translatable:
-                        raw_items = transcript_obj.translate("en").fetch()
-                    else:
-                        raw_items = transcript_obj.fetch()
-                    segments = []
-                    texts = []
-                    for item in raw_items:
-                        s = float(item.get("start", 0.0) if isinstance(item, dict) else getattr(item, "start", 0.0))
-                        d = float(item.get("duration", 2.0) if isinstance(item, dict) else getattr(item, "duration", 2.0))
-                        txt = (item.get("text", "") if isinstance(item, dict) else getattr(item, "text", "")).replace("\n", " ").strip()
-                        if txt:
-                            segments.append({"start": round(s, 2), "end": round(s + d, 2), "text": txt})
-                            texts.append(txt)
-                    if segments:
-                        full_txt = " ".join(texts).strip()
-                        if task == "translate" and lang != "en":
-                            full_txt = ai_translate_to_english(full_txt)
-                        return full_txt, segments, lang
-            else:
-                api_inst = YouTubeTranscriptApi()
-                fetched = api_inst.fetch(yt_id)
-                segments = []
-                texts = []
-                for snippet in fetched:
-                    s = float(getattr(snippet, "start", 0.0))
-                    d = float(getattr(snippet, "duration", 2.0))
-                    txt = str(getattr(snippet, "text", "")).replace("\n", " ").strip()
-                    if txt:
-                        segments.append({"start": round(s, 2), "end": round(s + d, 2), "text": txt})
-                        texts.append(txt)
-                if segments:
-                    return " ".join(texts).strip(), segments, "en"
-        except Exception as e:
-            print(f"[Caption API fallback info] {e}")
-
-    # 2. Try Piped Subtitles API
-    for api in ("https://pipedapi.kavin.rocks", "https://pipedapi.tokhmi.xyz"):
-        try:
-            r = requests.get(f"{api}/streams/{yt_id}", timeout=10)
+            r = requests.get(f"{api}/streams/{yt_id}", timeout=12, headers={"User-Agent": "Mozilla/5.0"})
             if r.status_code == 200:
                 data = r.json()
-                subs = data.get("subtitles") or []
-                if subs:
-                    sub_url = subs[0].get("url")
-                    lang = (subs[0].get("code") or "en").split("-")[0].lower()
-                    if sub_url:
-                        sr = requests.get(sub_url, timeout=10)
-                        if sr.status_code == 200 and sr.text:
-                            clean_lines = [
-                                re.sub(r"<[^>]+>", "", ln).strip()
-                                for ln in sr.text.splitlines()
-                                if ln.strip() and "-->" not in ln and not ln.strip().isdigit() and not ln.startswith("WEBVTT")
-                            ]
-                            if clean_lines:
-                                segments = []
-                                for idx, ln in enumerate(clean_lines):
-                                    segments.append({"start": float(idx * 4), "end": float((idx + 1) * 4), "text": ln})
-                                return " ".join(clean_lines), segments, lang
+                v_streams = [s for s in (data.get("videoStreams") or []) if not s.get("videoOnly") and s.get("url")]
+                if v_streams:
+                    stream_url = v_streams[0]["url"]
+                    with requests.get(stream_url, stream=True, timeout=90, headers={"User-Agent": "Mozilla/5.0"}) as sr:
+                        if sr.status_code == 200:
+                            with open(output_path, "wb") as f:
+                                for chunk in sr.iter_content(chunk_size=512 * 1024):
+                                    if chunk:
+                                        f.write(chunk)
+                            if os.path.exists(output_path) and os.path.getsize(output_path) > 20000:
+                                return output_path
         except Exception:
             continue
 
-    return None, None, None
+    invidious_apis = [
+        "https://inv.nadeko.net",
+        "https://invidious.nerdvpn.de",
+        "https://invidious.privacyredirect.com",
+        "https://yewtu.be",
+    ]
+    for api in invidious_apis:
+        try:
+            r = requests.get(f"{api}/api/v1/videos/{yt_id}", timeout=12, headers={"User-Agent": "Mozilla/5.0"})
+            if r.status_code == 200:
+                data = r.json()
+                for fs in (data.get("formatStreams") or []):
+                    s_url = fs.get("url")
+                    if s_url:
+                        with requests.get(s_url, stream=True, timeout=90, headers={"User-Agent": "Mozilla/5.0"}) as sr:
+                            if sr.status_code == 200:
+                                with open(output_path, "wb") as f:
+                                    for chunk in sr.iter_content(chunk_size=512 * 1024):
+                                        if chunk:
+                                            f.write(chunk)
+                                if os.path.exists(output_path) and os.path.getsize(output_path) > 20000:
+                                    return output_path
+        except Exception:
+            continue
+    return None
 
 
 def download_video(url, job_id, height=480):
@@ -565,24 +463,24 @@ def download_video(url, job_id, height=480):
             if _write_sanitized_cookies(cookies_txt, candidate_cookie):
                 cookie_file = candidate_cookie
 
-        strategies = []
-        if cookie_file:
-            strategies.append({
-                "cookiefile": cookie_file,
-                "format": f"bestvideo[height<={h}]+bestaudio/best[height<={h}]/best/b/bv*+ba*",
-                "extractor_args": {"youtube": {"player_client": ["web", "mweb", "tv_embedded"]}},
-            })
-            strategies.append({
-                "cookiefile": cookie_file,
-                "format": "best/b/bv*+ba*",
-            })
-        strategies.append({
-            "format": f"best[height<={h}]/best/b/bv*+ba*",
-            "extractor_args": {"youtube": {"player_client": ["ios", "android", "tv_embedded", "mweb"]}},
-        })
-
         try:
-            for strat in strategies:
+            # Engine 1: Try pytubefix ANDROID_VR / MWEB first (frequently bypasses datacenter bot & format blocks)
+            set_job(job_id, progress=7, stage="Downloading YouTube video stream...")
+            pt_file = _download_with_pytubefix(clean_url, output_path)
+            if pt_file:
+                return pt_file
+
+            # Engine 2: yt-dlp with dynamic format inspection (never fails on "Requested format is not available")
+            client_combinations = [
+                {"use_cookie": True,  "clients": ["mweb", "web_creator", "tv_embedded", "web"]},
+                {"use_cookie": True,  "clients": None},
+                {"use_cookie": False, "clients": ["android_vr", "ios", "mweb", "tv_embedded"]},
+            ]
+
+            for combo in client_combinations:
+                if combo["use_cookie"] and not cookie_file:
+                    continue
+
                 for f in os.listdir(app.config['UPLOAD_FOLDER']):
                     if f.startswith(f"{job_id}_source"):
                         try:
@@ -600,35 +498,45 @@ def download_video(url, job_id, height=480):
                     'concurrent_fragment_downloads': 4,
                     'merge_output_format': 'mp4',
                     'progress_hooks': [ydl_hook],
+                    'format': f'bestvideo[height<={h}]+bestaudio/best[height<={h}]/bestvideo+bestaudio/best/b/bv*+ba*/w',
                 }
-                ydl_opts.update(strat)
+                if combo["use_cookie"] and cookie_file:
+                    ydl_opts['cookiefile'] = cookie_file
+                if combo["clients"]:
+                    ydl_opts['extractor_args'] = {'youtube': {'player_client': combo["clients"]}}
 
                 try:
                     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                        ydl.download([clean_url])
-                    final_file = _locate_downloaded_file(
-                        os.path.join(app.config['UPLOAD_FOLDER'], f"{job_id}_source"),
-                        output_path,
-                    )
-                    if final_file:
-                        return final_file
+                        info = ydl.extract_info(clean_url, download=False)
+                        formats = [
+                            f for f in (info.get("formats") or [])
+                            if f.get("url") and f.get("vcodec") != "none"
+                        ]
+                        if not formats:
+                            formats = [f for f in (info.get("formats") or []) if f.get("url")]
+                        if formats:
+                            ydl.download([clean_url])
+                            final_file = _locate_downloaded_file(
+                                os.path.join(app.config['UPLOAD_FOLDER'], f"{job_id}_source"),
+                                output_path,
+                            )
+                            if final_file:
+                                return final_file
                 except Exception as e:
-                    print(f"[yt-dlp retry] {e}")
+                    print(f"[yt-dlp combo retry] {e}")
                     continue
 
-            # Fallback 2: Download via Piped / Invidious public mirror APIs
+            # Engine 3: Active Piped / Invidious mirror streams
             if yt_id:
-                set_job(job_id, progress=10, stage="Using cloud mirror for YouTube stream...")
-                mirrored = _download_via_piped_or_invidious(yt_id, output_path)
+                set_job(job_id, progress=10, stage="Fetching video from cloud mirror...")
+                mirrored = _download_via_active_mirrors(yt_id, clean_url, output_path)
                 if mirrored:
                     return mirrored
 
-                # Fallback 3: Build playable video from YouTube HD thumbnail so pipeline can complete via Caption API
-                fallback_mp4 = _generate_fallback_video_from_thumbnail(yt_id, output_path, duration_sec=120)
-                if fallback_mp4:
-                    return fallback_mp4
-
-            raise RuntimeError("Unable to retrieve YouTube video from any source.")
+            raise RuntimeError(
+                "YouTube blocked the video stream on this cloud IP. "
+                "Please refresh your YOUTUBE_COOKIES in Render Environment Variables or upload the .mp4 file directly."
+            )
         finally:
             if cookie_file and os.path.exists(cookie_file):
                 try:
@@ -693,7 +601,7 @@ def capture_frame_at_timestamp(video_path, timestamp_sec, tag):
     return ""
 
 
-def run_pipeline(job_id, video_source, options, youtube_url=None):
+def run_pipeline(job_id, video_source, options):
     app_ctx = app.app_context()
     app_ctx.push()
     try:
@@ -701,44 +609,25 @@ def run_pipeline(job_id, video_source, options, youtube_url=None):
         num_parts          = PART_COUNTS[options["num_parts"]]
         task               = "translate" if options["translate_to_english"] else "transcribe"
         summary_length_key = options["summary_length"]
-        yt_id              = extract_youtube_id(youtube_url) if youtube_url else None
 
-        transcript_text = None
-        segments_data = None
-        detected_language = "en"
+        set_job(job_id, status="running", stage="Extracting audio", progress=15)
+        audio_path = os.path.join(app.config['AUDIO_FOLDER'], f"{job_id}.wav")
+        extract_audio_ffmpeg(video_source, audio_path)
+
+        def report_progress(step, total_steps):
+            frac = min(step / total_steps, 1.0) if total_steps else 0
+            pct  = 25 + int(frac * 35)
+            set_job(job_id, progress=pct, stage="Transcribing via Groq Cloud Whisper...")
+
+        set_job(job_id, stage="Transcribing via Groq Cloud Whisper", progress=25)
+        transcript_text, segments_data, detected_language = transcribe_audio_groq(
+            audio_path, task=task, progress_callback=report_progress
+        )
+
         original_transcript_text = None
-
-        # If this is a YouTube link, try instant YouTube Captions first (or as fallback if audio is silent)
-        if yt_id:
-            set_job(job_id, status="running", stage="Fetching YouTube captions...", progress=20)
-            cap_text, cap_segs, cap_lang = fetch_youtube_captions_fallback(yt_id, task=task)
-            if cap_text and cap_segs:
-                transcript_text = cap_text
-                segments_data = cap_segs
-                detected_language = cap_lang or "en"
-                if options["keep_original_too"] and task == "translate":
-                    orig_t, _, _ = fetch_youtube_captions_fallback(yt_id, task="transcribe")
-                    original_transcript_text = orig_t
-
-        # If not obtained via YouTube captions (or uploaded file), run Groq Cloud Whisper
-        if not transcript_text:
-            set_job(job_id, status="running", stage="Extracting audio", progress=15)
-            audio_path = os.path.join(app.config['AUDIO_FOLDER'], f"{job_id}.wav")
-            extract_audio_ffmpeg(video_source, audio_path)
-
-            def report_progress(step, total_steps):
-                frac = min(step / total_steps, 1.0) if total_steps else 0
-                pct  = 25 + int(frac * 35)
-                set_job(job_id, progress=pct, stage="Transcribing via Groq Cloud Whisper...")
-
-            set_job(job_id, stage="Transcribing via Groq Cloud Whisper", progress=25)
-            transcript_text, segments_data, detected_language = transcribe_audio_groq(
-                audio_path, task=task, progress_callback=report_progress
-            )
-
-            if options["keep_original_too"] and task == "translate":
-                set_job(job_id, stage="Also generating original-language transcript", progress=55)
-                original_transcript_text, _, _ = transcribe_audio_groq(audio_path, task="transcribe")
+        if options["keep_original_too"] and task == "translate":
+            set_job(job_id, stage="Also generating original-language transcript", progress=55)
+            original_transcript_text, _, _ = transcribe_audio_groq(audio_path, task="transcribe")
 
         set_job(job_id, stage="Generating AI summary", progress=68)
         summary_text = (
@@ -888,7 +777,7 @@ def process_video():
         try:
             set_job(job_id, status="running", stage="Downloading video", progress=5)
             video_source = download_video(url, job_id, VIDEO_QUALITIES[options["video_quality"]])
-            run_pipeline(job_id, video_source, options, youtube_url=url)
+            run_pipeline(job_id, video_source, options)
         except Exception as exc:
             traceback.print_exc()
             set_job(job_id, status="error", stage="Failed", error=str(exc))
@@ -897,7 +786,7 @@ def process_video():
         video_source = os.path.join(app.config['UPLOAD_FOLDER'], f"{job_id}_uploaded.mp4")
         file.save(video_source)
         set_job(job_id, status="running", stage="Uploaded, starting pipeline", progress=8)
-        threading.Thread(target=run_pipeline, args=(job_id, video_source, options, None), daemon=True).start()
+        threading.Thread(target=run_pipeline, args=(job_id, video_source, options), daemon=True).start()
     else:
         threading.Thread(target=worker, daemon=True).start()
 

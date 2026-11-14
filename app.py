@@ -298,7 +298,7 @@ def download_video(url, job_id, height=480):
     output_path = os.path.join(app.config['UPLOAD_FOLDER'], f"{job_id}_source.mp4")
     if "youtube.com" in url or "youtu.be" in url:
         clean_url = url.split("&si=")[0].split("?si=")[0]
-        height_filter = f"[height<={height}]" if height else "[height<=480]"
+        h = height or 480
 
         def ydl_hook(d):
             if d.get('status') == 'downloading':
@@ -309,7 +309,7 @@ def download_video(url, job_id, height=480):
                     set_job(job_id, progress=pct, stage=f"Downloading video ({int(downloaded * 100 / total)}%)")
 
         ydl_opts = {
-            'format': f'best{height_filter}[ext=mp4]/bestvideo{height_filter}[ext=mp4]+bestaudio[ext=m4a]/best{height_filter}/best',
+            'format': f'bestvideo[height<={h}]+bestaudio/best[height<={h}]/bestvideo+bestaudio/best',
             'outtmpl': output_path,
             'quiet': True,
             'no_warnings': True,
@@ -317,11 +317,6 @@ def download_video(url, job_id, height=480):
             'concurrent_fragment_downloads': 4,
             'merge_output_format': 'mp4',
             'progress_hooks': [ydl_hook],
-            'extractor_args': {
-                'youtube': {
-                    'player_client': ['android', 'ios', 'web'],
-                }
-            },
         }
 
         cookies_txt = os.getenv("YOUTUBE_COOKIES", "").strip()
@@ -331,6 +326,12 @@ def download_video(url, job_id, height=480):
             with open(cookie_file, "w", encoding="utf-8") as cf:
                 cf.write(cookies_txt)
             ydl_opts['cookiefile'] = cookie_file
+        else:
+            ydl_opts['extractor_args'] = {
+                'youtube': {
+                    'player_client': ['android', 'ios', 'web'],
+                }
+            }
 
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -513,7 +514,6 @@ def run_pipeline(job_id, video_source, options):
         traceback.print_exc()
         set_job(job_id, status="error", stage="Failed", error=str(exc))
     finally:
-        # 1. Always delete temporary audio immediately
         audio_file = os.path.join(app.config['AUDIO_FOLDER'], f"{job_id}.wav")
         if os.path.exists(audio_file):
             try:
@@ -521,7 +521,6 @@ def run_pipeline(job_id, video_source, options):
             except Exception:
                 pass
 
-        # 2. Purge older videos/frames from previous runs while keeping current job_id for playback/download
         for folder in (app.config['UPLOAD_FOLDER'], app.config['FRAMES_FOLDER']):
             try:
                 for fname in os.listdir(folder):

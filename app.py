@@ -488,7 +488,7 @@ def run_pipeline(job_id, video_source, options):
             },
         )
 
-   except Exception as exc:
+    except Exception as exc:
         traceback.print_exc()
         set_job(job_id, status="error", stage="Failed", error=str(exc))
     finally:

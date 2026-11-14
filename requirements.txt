@@ -4,7 +4,8 @@ nltk
 numpy
 requests
 yt-dlp[default]
+bgutil-ytdlp-pot-provider
 pytubefix
+youtube-transcript-api
 python-dotenv
 openai
-youtube-transcript-api

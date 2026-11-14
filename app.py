@@ -22,16 +22,6 @@ from nltk.tokenize import sent_tokenize, word_tokenize
 from nltk.corpus import stopwords
 from collections import Counter
 
-try:
-    from pytubefix import YouTube as PyTubeYouTube
-except ImportError:
-    PyTubeYouTube = None
-
-try:
-    from youtube_transcript_api import YouTubeTranscriptApi
-except ImportError:
-    YouTubeTranscriptApi = None
-
 for _pkg in ('punkt', 'punkt_tab', 'stopwords'):
     try:
         nltk.data.find(f'tokenizers/{_pkg}' if 'punkt' in _pkg else f'corpora/{_pkg}')
@@ -305,17 +295,27 @@ def new_job():
         }
     return job_id
 
-# ----------------- REAL YOUTUBE VIDEO DOWNLOADER (MULTI-ENGINE) ----------------- #
-def extract_youtube_id(url):
-    if not url:
+# ----------------- YOUTUBE COOKIE & DOWNLOAD ENGINE ----------------- #
+def _prepare_cookie_file(job_id):
+    """Loads cookies from Render Secret File (/etc/secrets/cookies.txt) or YOUTUBE_COOKIES env var."""
+    dest_cookie = os.path.join(app.config['AUDIO_FOLDER'], f"{job_id}_cookies.txt")
+
+    # 1. Check Render Secret Files first (preserves multiline formatting cleanly)
+    for secret_path in ("/etc/secrets/cookies.txt", os.path.join(BASE_DIR, "cookies.txt")):
+        if os.path.exists(secret_path) and os.path.getsize(secret_path) > 20:
+            shutil.copyfile(secret_path, dest_cookie)
+            print(f"[Cookies] Loaded Secret File from {secret_path}")
+            return dest_cookie
+
+    # 2. Fallback: Parse YOUTUBE_COOKIES environment variable (even if flattened to 1 line)
+    raw_env = os.getenv("YOUTUBE_COOKIES", "").strip()
+    if not raw_env:
         return None
-    m = re.search(r"(?:v=|youtu\.be/|embed/|shorts/)([A-Za-z0-9_-]{11})", url)
-    return m.group(1) if m else None
 
-
-def _write_sanitized_cookies(raw_cookies, dest_path):
+    # Split flattened single-line cookies if newlines were stripped by Render
+    raw_env = re.sub(r"\s+(?=(?:#HttpOnly_)?\.?(?:youtube|google)\.com\b)", "\n", raw_env)
     lines = ["# Netscape HTTP Cookie File"]
-    for raw_line in raw_cookies.splitlines():
+    for raw_line in raw_env.splitlines():
         line = raw_line.strip()
         if not line or (line.startswith("#") and not line.startswith("#HttpOnly_")):
             continue
@@ -324,11 +324,13 @@ def _write_sanitized_cookies(raw_cookies, dest_path):
             lines.append("\t".join(parts))
         elif len(parts) == 6:
             lines.append("\t".join(parts + [""]))
-    if len(lines) <= 1:
-        return False
-    with open(dest_path, "w", encoding="utf-8", newline="\n") as f:
-        f.write("\n".join(lines) + "\n")
-    return True
+
+    if len(lines) > 1:
+        with open(dest_cookie, "w", encoding="utf-8", newline="\n") as f:
+            f.write("\n".join(lines) + "\n")
+        print(f"[Cookies] Reconstructed {len(lines)-1} cookie entries from YOUTUBE_COOKIES env")
+        return dest_cookie
+    return None
 
 
 def _locate_downloaded_file(base_no_ext, expected_mp4):
@@ -357,95 +359,12 @@ def _locate_downloaded_file(base_no_ext, expected_mp4):
     return None
 
 
-def _download_with_pytubefix(clean_url, output_path):
-    """Engine 2: Uses pytubefix with ANDROID_VR / MWEB /TV clients which bypass yt-dlp format blocks."""
-    if PyTubeYouTube is None:
-        return None
-    for client_name in ("ANDROID_VR", "MWEB", "IOS", "WEB_EMBED", "TV"):
-        try:
-            yt = PyTubeYouTube(clean_url, client=client_name)
-            stream = (
-                yt.streams.filter(progressive=True, file_extension="mp4")
-                .order_by("resolution")
-                .desc()
-                .first()
-            )
-            if not stream:
-                stream = yt.streams.filter(file_extension="mp4").first() or yt.streams.first()
-            if stream:
-                tmp_dir = os.path.dirname(output_path)
-                tmp_name = os.path.basename(output_path)
-                stream.download(output_path=tmp_dir, filename=tmp_name)
-                if os.path.exists(output_path) and os.path.getsize(output_path) > 10000:
-                    return output_path
-        except Exception as e:
-            print(f"[pytubefix {client_name} retry] {e}")
-            continue
-    return None
-
-
-def _download_via_active_mirrors(yt_id, clean_url, output_path):
-    """Engine 3: Downloads real MP4 stream from active Piped / Invidious / Cobalt instances."""
-    piped_apis = [
-        "https://pipedapi.adminforge.de",
-        "https://pipedapi.drgns.space",
-        "https://pipedapi.smnz.de",
-        "https://pipedapi.leptons.xyz",
-        "https://pipedapi.nosebs.ru",
-    ]
-    for api in piped_apis:
-        try:
-            r = requests.get(f"{api}/streams/{yt_id}", timeout=12, headers={"User-Agent": "Mozilla/5.0"})
-            if r.status_code == 200:
-                data = r.json()
-                v_streams = [s for s in (data.get("videoStreams") or []) if not s.get("videoOnly") and s.get("url")]
-                if v_streams:
-                    stream_url = v_streams[0]["url"]
-                    with requests.get(stream_url, stream=True, timeout=90, headers={"User-Agent": "Mozilla/5.0"}) as sr:
-                        if sr.status_code == 200:
-                            with open(output_path, "wb") as f:
-                                for chunk in sr.iter_content(chunk_size=512 * 1024):
-                                    if chunk:
-                                        f.write(chunk)
-                            if os.path.exists(output_path) and os.path.getsize(output_path) > 20000:
-                                return output_path
-        except Exception:
-            continue
-
-    invidious_apis = [
-        "https://inv.nadeko.net",
-        "https://invidious.nerdvpn.de",
-        "https://invidious.privacyredirect.com",
-        "https://yewtu.be",
-    ]
-    for api in invidious_apis:
-        try:
-            r = requests.get(f"{api}/api/v1/videos/{yt_id}", timeout=12, headers={"User-Agent": "Mozilla/5.0"})
-            if r.status_code == 200:
-                data = r.json()
-                for fs in (data.get("formatStreams") or []):
-                    s_url = fs.get("url")
-                    if s_url:
-                        with requests.get(s_url, stream=True, timeout=90, headers={"User-Agent": "Mozilla/5.0"}) as sr:
-                            if sr.status_code == 200:
-                                with open(output_path, "wb") as f:
-                                    for chunk in sr.iter_content(chunk_size=512 * 1024):
-                                        if chunk:
-                                            f.write(chunk)
-                                if os.path.exists(output_path) and os.path.getsize(output_path) > 20000:
-                                    return output_path
-        except Exception:
-            continue
-    return None
-
-
 def download_video(url, job_id, height=480):
     output_path = os.path.join(app.config['UPLOAD_FOLDER'], f"{job_id}_source.mp4")
     base_outtmpl = os.path.join(app.config['UPLOAD_FOLDER'], f"{job_id}_source.%(ext)s")
 
     if "youtube.com" in url or "youtu.be" in url:
         clean_url = url.split("&si=")[0].split("?si=")[0]
-        yt_id = extract_youtube_id(clean_url)
         h = height or 480
 
         def ydl_hook(d):
@@ -456,87 +375,34 @@ def download_video(url, job_id, height=480):
                     pct = min(14, max(5, 5 + int((downloaded / total) * 9)))
                     set_job(job_id, progress=pct, stage=f"Downloading video ({int(downloaded * 100 / total)}%)")
 
-        cookies_txt = os.getenv("YOUTUBE_COOKIES", "").strip()
-        cookie_file = None
-        if cookies_txt:
-            candidate_cookie = os.path.join(app.config['AUDIO_FOLDER'], f"{job_id}_cookies.txt")
-            if _write_sanitized_cookies(cookies_txt, candidate_cookie):
-                cookie_file = candidate_cookie
+        cookie_file = _prepare_cookie_file(job_id)
 
         try:
-            # Engine 1: Try pytubefix ANDROID_VR / MWEB first (frequently bypasses datacenter bot & format blocks)
-            set_job(job_id, progress=7, stage="Downloading YouTube video stream...")
-            pt_file = _download_with_pytubefix(clean_url, output_path)
-            if pt_file:
-                return pt_file
+            ydl_opts = {
+                'format': f'bestvideo[height<={h}]+bestaudio/best[height<={h}]/bestvideo+bestaudio/best',
+                'outtmpl': base_outtmpl,
+                'quiet': False,
+                'no_warnings': False,
+                'noplaylist': True,
+                'geo_bypass': True,
+                'nocheckcertificate': True,
+                'concurrent_fragment_downloads': 4,
+                'merge_output_format': 'mp4',
+                'progress_hooks': [ydl_hook],
+            }
+            if cookie_file:
+                ydl_opts['cookiefile'] = cookie_file
 
-            # Engine 2: yt-dlp with dynamic format inspection (never fails on "Requested format is not available")
-            client_combinations = [
-                {"use_cookie": True,  "clients": ["mweb", "web_creator", "tv_embedded", "web"]},
-                {"use_cookie": True,  "clients": None},
-                {"use_cookie": False, "clients": ["android_vr", "ios", "mweb", "tv_embedded"]},
-            ]
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([clean_url])
 
-            for combo in client_combinations:
-                if combo["use_cookie"] and not cookie_file:
-                    continue
-
-                for f in os.listdir(app.config['UPLOAD_FOLDER']):
-                    if f.startswith(f"{job_id}_source"):
-                        try:
-                            os.remove(os.path.join(app.config['UPLOAD_FOLDER'], f))
-                        except Exception:
-                            pass
-
-                ydl_opts = {
-                    'outtmpl': base_outtmpl,
-                    'quiet': True,
-                    'no_warnings': True,
-                    'noplaylist': True,
-                    'geo_bypass': True,
-                    'nocheckcertificate': True,
-                    'concurrent_fragment_downloads': 4,
-                    'merge_output_format': 'mp4',
-                    'progress_hooks': [ydl_hook],
-                    'format': f'bestvideo[height<={h}]+bestaudio/best[height<={h}]/bestvideo+bestaudio/best/b/bv*+ba*/w',
-                }
-                if combo["use_cookie"] and cookie_file:
-                    ydl_opts['cookiefile'] = cookie_file
-                if combo["clients"]:
-                    ydl_opts['extractor_args'] = {'youtube': {'player_client': combo["clients"]}}
-
-                try:
-                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                        info = ydl.extract_info(clean_url, download=False)
-                        formats = [
-                            f for f in (info.get("formats") or [])
-                            if f.get("url") and f.get("vcodec") != "none"
-                        ]
-                        if not formats:
-                            formats = [f for f in (info.get("formats") or []) if f.get("url")]
-                        if formats:
-                            ydl.download([clean_url])
-                            final_file = _locate_downloaded_file(
-                                os.path.join(app.config['UPLOAD_FOLDER'], f"{job_id}_source"),
-                                output_path,
-                            )
-                            if final_file:
-                                return final_file
-                except Exception as e:
-                    print(f"[yt-dlp combo retry] {e}")
-                    continue
-
-            # Engine 3: Active Piped / Invidious mirror streams
-            if yt_id:
-                set_job(job_id, progress=10, stage="Fetching video from cloud mirror...")
-                mirrored = _download_via_active_mirrors(yt_id, clean_url, output_path)
-                if mirrored:
-                    return mirrored
-
-            raise RuntimeError(
-                "YouTube blocked the video stream on this cloud IP. "
-                "Please refresh your YOUTUBE_COOKIES in Render Environment Variables or upload the .mp4 file directly."
+            final_file = _locate_downloaded_file(
+                os.path.join(app.config['UPLOAD_FOLDER'], f"{job_id}_source"),
+                output_path,
             )
+            if final_file:
+                return final_file
+            raise RuntimeError("Downloaded file not found after yt-dlp finished.")
         finally:
             if cookie_file and os.path.exists(cookie_file):
                 try:

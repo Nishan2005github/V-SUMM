@@ -155,9 +155,31 @@ def ai_summarize_part(text):
     if not text:
         return None
     return call_ai_llm(
-        system_prompt="You are a concise video segment summarizer. Reply directly with a 1-2 sentence summary.",
+        system_prompt="You are a concise video segment summarizer. Reply directly with a 1-2 sentence summary in plain English.",
         user_prompt=f"Summarize this video segment in 1-2 sentences:\n\n{text[:2500]}",
         max_tokens=600,
+        temperature=0.3,
+    )
+
+
+def ai_answer_question(question, transcript, summary=""):
+    if not question or not transcript:
+        return None
+    return call_ai_llm(
+        system_prompt=(
+            "You are a concise, intelligent video assistant. "
+            "Write clear, direct answers in 1-2 sentences in plain English. "
+            "First use the provided video transcript and summary. "
+            "If the exact detail is not in the transcript, think and provide a relatable, accurate 1-2 sentence answer connected to the video's topic using your own knowledge. "
+            "Never mention that you are an AI and never say the transcript does not contain the answer."
+        ),
+        user_prompt=(
+            f"Video Summary:\n{(summary or '')[:2000]}\n\n"
+            f"Video Transcript:\n{transcript[:8000]}\n\n"
+            f"Question: {question}\n\n"
+            f"Reply directly in 1-2 clear sentences:"
+        ),
+        max_tokens=200,
         temperature=0.3,
     )
 
@@ -166,12 +188,45 @@ def ai_translate_to_english(text):
     if not text:
         return text
     translated = call_ai_llm(
-        system_prompt="Translate the following transcript accurately into natural English. Return only the translated text.",
+        system_prompt=(
+            "You are an expert translator. "
+            "Translate the following transcript accurately into natural, plain English. "
+            "Return only the English translation."
+        ),
         user_prompt=text[:7000],
         max_tokens=1500,
         temperature=0.2,
     )
     return translated or text
+
+
+def translate_segments_to_english(segments, full_english_text=None):
+    """Ensures every interactive transcript line is in English."""
+    if not segments:
+        return segments
+    # Translate in batches of 25 lines using numbered lines so timestamps stay aligned
+    translated_segs = [dict(s) for s in segments]
+    batch_size = 25
+    for start_idx in range(0, len(translated_segs), batch_size):
+        batch = translated_segs[start_idx:start_idx + batch_size]
+        numbered_input = "\n".join(f"{i+1}. {seg['text']}" for i, seg in enumerate(batch))
+        out = call_ai_llm(
+            system_prompt=(
+                "Translate each numbered line into natural English. "
+                "Keep the exact same line numbers (1., 2., etc.) and return only the numbered English lines."
+            ),
+            user_prompt=numbered_input,
+            max_tokens=1200,
+            temperature=0.2,
+        )
+        if out:
+            for line in out.splitlines():
+                m = re.match(r"^\s*(\d+)[\.\)\-:]\s*(.+)$", line.strip())
+                if m:
+                    idx = int(m.group(1)) - 1
+                    if 0 <= idx < len(batch):
+                        batch[idx]["text"] = m.group(2).strip()
+    return translated_segs
 
 # ----------------- GROQ CLOUD WHISPER TRANSCRIPTION ----------------- #
 def transcribe_audio_groq(audio_path, task="transcribe", progress_callback=None):
@@ -318,7 +373,7 @@ def new_job():
         }
     return job_id
 
-# ----------------- YOUTUBE ENGINE (COOKIES + AUDIO + SUBTITLES + MIRRORS) ----------------- #
+# ----------------- YOUTUBE ENGINE (ENGLISH-FIRST SUBTITLES + AUDIO) ----------------- #
 def extract_youtube_id(url):
     if not url:
         return None
@@ -432,9 +487,12 @@ def _fetch_transcript_via_public_apis(yt_id):
             r = requests.get(f"{api}/api/v1/captions/{yt_id}", timeout=10, headers={"User-Agent": "Mozilla/5.0"})
             if r.status_code == 200:
                 caps = (r.json() or {}).get("captions") or []
-                if caps:
-                    label = caps[0].get("label") or "English"
-                    cr = requests.get(f"{api}/api/v1/captions/{yt_id}?label={label}", timeout=10)
+                en_cap = next((c for c in caps if "en" in (c.get("languageCode") or "").lower() or "english" in (c.get("label") or "").lower()), None)
+                chosen_cap = en_cap or (caps[0] if caps else None)
+                if chosen_cap:
+                    label = chosen_cap.get("label") or "English"
+                    lang_code = (chosen_cap.get("languageCode") or "en").split("-")[0].lower()
+                    cr = requests.get(f"{api}/api/v1/captions/{yt_id}?label={label}&tlang=en", timeout=10)
                     if cr.status_code == 200 and cr.text:
                         lines = [
                             re.sub(r"<[^>]+>", "", ln).strip()
@@ -443,27 +501,7 @@ def _fetch_transcript_via_public_apis(yt_id):
                         ]
                         if lines:
                             segs = [{"start": float(i * 4), "end": float((i + 1) * 4), "text": t} for i, t in enumerate(lines)]
-                            return " ".join(lines).strip(), segs, "en"
-        except Exception:
-            continue
-
-    for api in ("https://pipedapi.adminforge.de", "https://pipedapi.drgns.space", "https://pipedapi.smnz.de"):
-        try:
-            r = requests.get(f"{api}/streams/{yt_id}", timeout=10, headers={"User-Agent": "Mozilla/5.0"})
-            if r.status_code == 200:
-                data = r.json()
-                subs = data.get("subtitles") or []
-                if subs and subs[0].get("url"):
-                    sr = requests.get(subs[0]["url"], timeout=10)
-                    if sr.status_code == 200 and sr.text:
-                        lines = [
-                            re.sub(r"<[^>]+>", "", ln).strip()
-                            for ln in sr.text.splitlines()
-                            if ln.strip() and "-->" not in ln and not ln.strip().isdigit() and not ln.startswith("WEBVTT")
-                        ]
-                        if lines:
-                            segs = [{"start": float(i * 4), "end": float((i + 1) * 4), "text": t} for i, t in enumerate(lines)]
-                            return " ".join(lines).strip(), segs, "en"
+                            return " ".join(lines).strip(), segs, lang_code
         except Exception:
             continue
 
@@ -471,13 +509,16 @@ def _fetch_transcript_via_public_apis(yt_id):
 
 
 def fetch_real_youtube_transcript(clean_url, yt_id, job_id, cookie_file=None, task="transcribe"):
+    # 1. Public Transcript APIs (requests English directly)
     if yt_id:
         pub_txt, pub_segs, pub_lang = _fetch_transcript_via_public_apis(yt_id)
         if pub_txt and pub_segs:
             if task == "translate" and pub_lang != "en":
                 pub_txt = ai_translate_to_english(pub_txt)
+                pub_segs = translate_segments_to_english(pub_segs, pub_txt)
             return pub_txt, pub_segs, pub_lang
 
+    # 2. youtube-transcript-api (prioritizes English or translates non-English track to English via YouTube API)
     if YouTubeTranscriptApi is not None and yt_id:
         try:
             if hasattr(YouTubeTranscriptApi, "list_transcripts"):
@@ -487,11 +528,20 @@ def fetch_real_youtube_transcript(clean_url, yt_id, job_id, cookie_file=None, ta
                 )
                 chosen = None
                 for tr in t_list:
-                    chosen = tr
-                    if tr.language_code.startswith("en"):
+                    if tr.language_code.lower().startswith("en"):
+                        chosen = tr
+                        break
+                if not chosen:
+                    for tr in t_list:
+                        chosen = tr
                         break
                 if chosen:
-                    lang = chosen.language_code.split("-")[0].lower()
+                    orig_lang = chosen.language_code.split("-")[0].lower()
+                    if task == "translate" and orig_lang != "en" and getattr(chosen, "is_translatable", False):
+                        try:
+                            chosen = chosen.translate("en")
+                        except Exception:
+                            pass
                     raw_items = chosen.fetch()
                     segments, texts = [], []
                     for item in raw_items:
@@ -503,19 +553,29 @@ def fetch_real_youtube_transcript(clean_url, yt_id, job_id, cookie_file=None, ta
                             texts.append(txt)
                     if segments:
                         full_txt = " ".join(texts).strip()
-                        if task == "translate" and lang != "en":
+                        if task == "translate" and not chosen.language_code.lower().startswith("en"):
                             full_txt = ai_translate_to_english(full_txt)
-                        return full_txt, segments, lang
+                            segments = translate_segments_to_english(segments, full_txt)
+                        return full_txt, segments, orig_lang
             else:
                 api_inst = YouTubeTranscriptApi()
                 t_list = api_inst.list(yt_id)
                 chosen = None
                 for tr in t_list:
-                    chosen = tr
-                    if getattr(tr, "language_code", "").startswith("en"):
+                    if getattr(tr, "language_code", "").lower().startswith("en"):
+                        chosen = tr
                         break
+                if not chosen:
+                    for tr in t_list:
+                        chosen = tr
+                        break
+                orig_lang = getattr(chosen, "language_code", "en").split("-")[0].lower() if chosen else "en"
+                if chosen and task == "translate" and orig_lang != "en" and getattr(chosen, "is_translatable", False):
+                    try:
+                        chosen = chosen.translate("en")
+                    except Exception:
+                        pass
                 fetched = chosen.fetch() if chosen else api_inst.fetch(yt_id)
-                lang = getattr(chosen, "language_code", "en").split("-")[0].lower() if chosen else "en"
                 segments, texts = [], []
                 for snippet in fetched:
                     s = float(getattr(snippet, "start", 0.0))
@@ -526,20 +586,30 @@ def fetch_real_youtube_transcript(clean_url, yt_id, job_id, cookie_file=None, ta
                         texts.append(txt)
                 if segments:
                     full_txt = " ".join(texts).strip()
-                    if task == "translate" and lang != "en":
+                    if task == "translate" and not getattr(chosen, "language_code", "en").lower().startswith("en"):
                         full_txt = ai_translate_to_english(full_txt)
-                    return full_txt, segments, lang
+                        segments = translate_segments_to_english(segments, full_txt)
+                    return full_txt, segments, orig_lang
         except Exception as e:
             print(f"[youtube_transcript_api] {e}")
 
+    # 3. yt-dlp subtitle extraction — STRICTLY English first (NEVER 'all', so random languages like Luo are never picked)
     sub_base = os.path.join(app.config['AUDIO_FOLDER'], f"{job_id}_sub")
     for client_list in (["web", "mweb"], ["ios", "android_vr", "tv"], None):
         try:
+            # Clean any leftover subtitle files first
+            for fname in os.listdir(app.config['AUDIO_FOLDER']):
+                if fname.startswith(f"{job_id}_sub"):
+                    try:
+                        os.remove(os.path.join(app.config['AUDIO_FOLDER'], fname))
+                    except Exception:
+                        pass
+
             ydl_opts = {
                 'skip_download': True,
                 'writesubtitles': True,
                 'writeautomaticsub': True,
-                'subtitleslangs': ['en.*', 'en', 'hi.*', 'hi', 'bn', 'all'],
+                'subtitleslangs': ['en', 'en-US', 'en-GB', 'en-IN', 'en-orig', 'hi', 'bn'],
                 'subtitlesformat': 'json3',
                 'outtmpl': sub_base,
                 'quiet': True,
@@ -555,28 +625,38 @@ def fetch_real_youtube_transcript(clean_url, yt_id, job_id, cookie_file=None, ta
                 info = ydl.extract_info(clean_url, download=True)
                 detected_lang = (info.get("language") or "en").split("-")[0].lower()
 
-            for fname in os.listdir(app.config['AUDIO_FOLDER']):
-                if fname.startswith(f"{job_id}_sub") and fname.endswith(".json3"):
-                    fpath = os.path.join(app.config['AUDIO_FOLDER'], fname)
-                    full_txt, segs = _parse_json3_subtitles(fpath)
-                    try:
-                        os.remove(fpath)
-                    except Exception:
-                        pass
-                    if full_txt and segs:
-                        if task == "translate" and detected_lang != "en":
-                            full_txt = ai_translate_to_english(full_txt)
-                        return full_txt, segs, detected_lang
+            # Sort candidate files so .en.json3 is always picked before any other language
+            sub_files = [
+                fname for fname in os.listdir(app.config['AUDIO_FOLDER'])
+                if fname.startswith(f"{job_id}_sub") and fname.endswith(".json3")
+            ]
+            sub_files.sort(key=lambda fn: (0 if ".en" in fn.lower() else 1, fn))
+
+            for fname in sub_files:
+                fpath = os.path.join(app.config['AUDIO_FOLDER'], fname)
+                is_english_file = ".en" in fname.lower()
+                full_txt, segs = _parse_json3_subtitles(fpath)
+                try:
+                    os.remove(fpath)
+                except Exception:
+                    pass
+                if full_txt and segs:
+                    if not is_english_file and task == "translate":
+                        full_txt = ai_translate_to_english(full_txt)
+                        segs = translate_segments_to_english(segs, full_txt)
+                    return full_txt, segs, ("en" if is_english_file else detected_lang)
         except Exception as e:
             print(f"[yt-dlp subtitle extract] {e}")
             continue
 
+    # 4. pytubefix captions (English prioritized)
     if PyTubeYouTube is not None:
         for client_name in ("WEB", "ANDROID_VR", "MWEB", "IOS", "TV_EMBED"):
             try:
                 yt = PyTubeYouTube(clean_url, client=client_name)
                 if yt.captions:
                     cap = yt.captions.get("en") or yt.captions.get("a.en") or list(yt.captions)[0]
+                    lang_code = getattr(cap, "code", "en").split(".")[-1].split("-")[0].lower()
                     xml_str = cap.xml_captions
                     matches = re.findall(r'start="([\d.]+)"\s+dur="([\d.]+)"[^>]*>(.*?)</text>', xml_str, re.DOTALL)
                     segments, texts = [], []
@@ -587,10 +667,15 @@ def fetch_real_youtube_transcript(clean_url, yt_id, job_id, cookie_file=None, ta
                             segments.append({"start": round(s_val, 2), "end": round(s_val + d_val, 2), "text": clean_t})
                             texts.append(clean_t)
                     if segments:
-                        return " ".join(texts).strip(), segments, "en"
+                        full_txt = " ".join(texts).strip()
+                        if lang_code != "en" and task == "translate":
+                            full_txt = ai_translate_to_english(full_txt)
+                            segments = translate_segments_to_english(segments, full_txt)
+                        return full_txt, segments, lang_code
             except Exception:
                 continue
 
+    # 5. Video Title & Description fallback
     try:
         meta_parts = []
         try:
@@ -854,7 +939,7 @@ def run_pipeline(job_id, video_source, options, youtube_url=None, has_real_video
                 print(f"[Whisper fallback to captions] {whisper_err}")
 
         if (not transcript_text or not segments_data) and yt_id:
-            set_job(job_id, status="running", stage="Fetching YouTube transcript...", progress=30)
+            set_job(job_id, status="running", stage="Fetching English YouTube transcript...", progress=30)
             cookie_file = _prepare_cookie_file(job_id)
             transcript_text, segments_data, detected_language = fetch_real_youtube_transcript(
                 clean_url, yt_id, job_id, cookie_file=cookie_file, task=task
@@ -1107,23 +1192,7 @@ def ask_question():
         return jsonify({"answer": "This video has no speech transcript to answer from."})
 
     try:
-        answer = call_ai_llm(
-            system_prompt=(
-                "You are a concise, intelligent video assistant. "
-                "STRICT RULE: Always answer in 1 to 2 short, direct sentences (maximum 40 words). "
-                "First use the provided video transcript and summary. "
-                "If the exact answer is not in the transcript, think and provide a relevant, accurate answer connected to the video's topic using your own knowledge. "
-                "Never say 'the transcript does not mention this' and never write more than 2 sentences."
-            ),
-            user_prompt=(
-                f"Video Summary:\n{(video_rec.summary or '')}\n\n"
-                f"Video Transcript:\n{transcript[:10000]}\n\n"
-                f"Question: {question}\n\n"
-                f"Answer in 1 to 2 short sentences only:"
-            ),
-            max_tokens=120,
-            temperature=0.3,
-        )
+        answer = ai_answer_question(question, transcript, summary=video_rec.summary)
         if not answer:
             fallback_sents = [s for s in sent_tokenize(transcript) if any(w in s.lower() for w in question.lower().split() if len(w) > 3)]
             if fallback_sents:
